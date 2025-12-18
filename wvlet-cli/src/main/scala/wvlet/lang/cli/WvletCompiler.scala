@@ -158,6 +158,17 @@ class WvletCompiler(
     // Convert the logical plan to Wvlet flow-style syntax
     generator.print(logicalPlan)
 
+  def showLogicalPlan: String =
+    val inputUnit = getInputUnit(forSQL = false)
+    val ctx       = compileInternal(inputUnit)
+    
+    // Get the resolved logical plan from the compilation unit
+    val logicalPlan = inputUnit.resolvedPlan
+    
+    // Use LogicalPlanPrinter to generate a string representation of the logical plan
+    import wvlet.lang.model.plan.LogicalPlanPrinter
+    LogicalPlanPrinter.print(logicalPlan)(using ctx)
+
   def run(): Unit =
     val compiler = createCompiler()
     Control.withResource(
