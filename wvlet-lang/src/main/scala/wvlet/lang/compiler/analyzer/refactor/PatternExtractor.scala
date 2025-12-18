@@ -1,0 +1,260 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package wvlet.lang.compiler.analyzer.refactor
+
+import wvlet.lang.compiler.CompilationUnit
+import wvlet.lang.compiler.Context
+import wvlet.lang.compiler.Phase
+import wvlet.lang.model.plan.*
+import wvlet.log.LogSupport
+
+/**
+  * Configuration for the PatternExtractor phase
+  *
+  * @param enabled
+  *   Whether pattern extraction is enabled
+  * @param refactorConfig
+  *   Configuration for refactoring decisions
+  * @param collectorConfig
+  *   Configuration for subtree collection
+  * @param detectorConfig
+  *   Configuration for duplicate detection
+  * @param maxSuggestions
+  *   Maximum number of suggestions to generate
+  * @param crossQueryAnalysis
+  *   Whether to analyze patterns across multiple queries
+  */
+case class PatternExtractorConfig(
+    enabled: Boolean = true,
+    refactorConfig: RefactorConfig = RefactorConfig.default,
+    collectorConfig: CollectorConfig = CollectorConfig.default,
+    detectorConfig: DetectorConfig = DetectorConfig.default,
+    maxSuggestions: Int = 10,
+    crossQueryAnalysis: Boolean = false
+)
+
+object PatternExtractorConfig:
+  val default: PatternExtractorConfig = PatternExtractorConfig()
+  
+  // Disabled by default
+  val disabled: PatternExtractorConfig = PatternExtractorConfig(enabled = false)
+
+/**
+  * Result of pattern extraction
+  *
+  * @param suggestions
+  *   List of refactoring suggestions
+  * @param detectionResult
+  *   Raw duplicate detection result
+  * @param report
+  *   Human-readable report
+  */
+case class PatternExtractionResult(
+    suggestions: List[RefactoringSuggestion],
+    detectionResult: DuplicateDetectionResult,
+    report: String
+):
+  /**
+    * Whether any actionable suggestions were found
+    */
+  def hasSuggestions: Boolean = suggestions.nonEmpty
+
+  /**
+    * Get the top suggestion
+    */
+  def topSuggestion: Option[RefactoringSuggestion] = suggestions.headOption
+
+  /**
+    * Total potential node reduction
+    */
+  def totalPotentialReduction: Int = suggestions.map(_.decision.estimatedReduction).sum
+
+end PatternExtractionResult
+
+/**
+  * Compiler phase for extracting duplicate patterns from LogicalPlan trees.
+  *
+  * This phase analyzes the logical plan to find repeated structural patterns that could be
+  * refactored into reusable models. It uses structural hashing for efficient candidate detection and
+  * anti-unification for parameter extraction.
+  *
+  * Usage:
+  * {{{
+  * // Single query analysis
+  * val result = PatternExtractor.analyze(plan)
+  *
+  * // Cross-query analysis
+  * val plans = List(("query1", plan1), ("query2", plan2))
+  * val result = PatternExtractor.analyzeMultiple(plans)
+  * }}}
+  */
+object PatternExtractor extends Phase("pattern-extractor") with LogSupport:
+
+  // Store results for later retrieval
+  private var lastResult: Option[PatternExtractionResult] = None
+
+  /**
+    * Get the last extraction result
+    */
+  def getLastResult: Option[PatternExtractionResult] = lastResult
+
+  /**
+    * Clear the last result
+    */
+  def clearLastResult(): Unit = lastResult = None
+
+  /**
+    * Phase entry point (called by compiler)
+    */
+  override def run(unit: CompilationUnit, context: Context): CompilationUnit =
+    // Check if pattern extraction is enabled
+    // For now, we run analysis but don't modify the plan
+    val config = PatternExtractorConfig.default
+
+    if !config.enabled then
+      return unit
+
+    // Extract the logical plan
+    val plan = unit.resolvedPlan match
+      case p: PackageDef =>
+        // Find the main query in the package
+        p.statements.collectFirst { case q: Query => q.child }.getOrElse(p)
+      case other => other
+
+    // Run analysis
+    val result = analyze(plan, config)
+    lastResult = Some(result)
+
+    // Log results
+    if result.hasSuggestions then
+      info(s"Found ${result.suggestions.size} refactoring opportunities")
+      debug(result.report)
+    else
+      debug("No refactoring opportunities found")
+
+    // Return original unit (no modifications yet)
+    // In future, could return modified unit with generated models
+    unit
+
+  /**
+    * Analyze a single LogicalPlan for duplicate patterns
+    *
+    * @param plan
+    *   The plan to analyze
+    * @param config
+    *   Configuration for extraction
+    * @return
+    *   Extraction result with suggestions
+    */
+  def analyze(
+      plan: LogicalPlan,
+      config: PatternExtractorConfig = PatternExtractorConfig.default
+  ): PatternExtractionResult =
+    debug(s"Analyzing plan for duplicate patterns...")
+
+    // Detect duplicates
+    val detectionResult = DuplicateDetector.detect(
+      plan,
+      config.detectorConfig,
+      config.collectorConfig
+    )
+
+    debug(detectionResult.summary)
+
+    // Evaluate and rank suggestions
+    val suggestions = RefactoringDecider.evaluateAll(
+      detectionResult,
+      config.refactorConfig
+    ).take(config.maxSuggestions)
+
+    // Generate report
+    val report = RefactoringDecider.generateReport(detectionResult, config.refactorConfig)
+
+    PatternExtractionResult(suggestions, detectionResult, report)
+
+  /**
+    * Analyze multiple LogicalPlans for cross-query patterns
+    *
+    * @param plans
+    *   List of (sourceId, plan) pairs
+    * @param config
+    *   Configuration for extraction
+    * @return
+    *   Extraction result with suggestions
+    */
+  def analyzeMultiple(
+      plans: List[(String, LogicalPlan)],
+      config: PatternExtractorConfig = PatternExtractorConfig.default
+  ): PatternExtractionResult =
+    debug(s"Analyzing ${plans.size} plans for cross-query patterns...")
+
+    // Detect duplicates across all plans
+    val detectionResult = DuplicateDetector.detectAcross(
+      plans,
+      config.detectorConfig,
+      config.collectorConfig
+    )
+
+    debug(detectionResult.summary)
+
+    // Evaluate and rank suggestions
+    val suggestions = RefactoringDecider.evaluateAll(
+      detectionResult,
+      config.refactorConfig
+    ).take(config.maxSuggestions)
+
+    // Generate report
+    val report = RefactoringDecider.generateReport(detectionResult, config.refactorConfig)
+
+    PatternExtractionResult(suggestions, detectionResult, report)
+
+  /**
+    * Quick analysis with default settings
+    */
+  def quickAnalyze(plan: LogicalPlan): PatternExtractionResult =
+    analyze(plan, PatternExtractorConfig.default)
+
+  /**
+    * Analyze with aggressive settings (more patterns detected)
+    */
+  def aggressiveAnalyze(plan: LogicalPlan): PatternExtractionResult =
+    val config = PatternExtractorConfig(
+      refactorConfig = RefactorConfig.aggressive,
+      collectorConfig = CollectorConfig(minDepth = 1, minNodeCount = 2),
+      detectorConfig = DetectorConfig.aggressive
+    )
+    analyze(plan, config)
+
+  /**
+    * Analyze with conservative settings (only significant patterns)
+    */
+  def conservativeAnalyze(plan: LogicalPlan): PatternExtractionResult =
+    val config = PatternExtractorConfig(
+      refactorConfig = RefactorConfig.conservative,
+      collectorConfig = CollectorConfig(minDepth = 3, minNodeCount = 5),
+      detectorConfig = DetectorConfig(minOccurrences = 3, minNodeCount = 5, minDepth = 3)
+    )
+    analyze(plan, config)
+
+  /**
+    * Print a summary of the extraction result
+    */
+  def printSummary(result: PatternExtractionResult): Unit =
+    info(result.report)
+
+    if result.hasSuggestions then
+      info("\nTop Refactoring Suggestions:")
+      RefactoringDecider.printSuggestions(result.suggestions)
+
+end PatternExtractor

@@ -18,6 +18,7 @@ import wvlet.lang.compiler.DBType
 import wvlet.lang.compiler.Phase
 import wvlet.lang.compiler.Symbol
 import wvlet.lang.compiler.WorkEnv
+import wvlet.lang.compiler.analyzer.refactor.*
 import wvlet.lang.runner.QueryExecutor
 import wvlet.lang.runner.connector.DBConnector
 import wvlet.lang.runner.connector.DBConnectorProvider
@@ -38,6 +39,26 @@ case class WvletCompilerOption(
     catalog: Option[String] = None,
     @option(prefix = "--schema", description = "Context database schema to use")
     schema: Option[String] = None
+)
+
+/**
+  * Options for pattern analysis command
+  */
+case class PatternAnalysisOption(
+    @option(prefix = "--min-occurrences", description = "Minimum occurrences to detect as duplicate")
+    minOccurrences: Int = 2,
+    @option(prefix = "--min-nodes", description = "Minimum node count for patterns")
+    minNodes: Int = 3,
+    @option(prefix = "--max-params", description = "Maximum parameters for model extraction")
+    maxParams: Int = 5,
+    @option(prefix = "--aggressive", description = "Use aggressive detection settings")
+    aggressive: Boolean = false,
+    @option(prefix = "--conservative", description = "Use conservative detection settings")
+    conservative: Boolean = false,
+    @option(prefix = "--top", description = "Number of top suggestions to show")
+    top: Int = 10,
+    @option(prefix = "--json", description = "Output results as JSON")
+    json: Boolean = false
 )
 
 class WvletCompiler(
@@ -175,5 +196,142 @@ class WvletCompiler(
       )
       println(queryResult.toPrettyBox())
     }
+
+  /**
+    * Analyze the query for duplicate patterns that could be refactored
+    */
+  def analyzePatterns(patternOption: PatternAnalysisOption): Unit =
+    val inputUnit = getInputUnit(forSQL = false)
+    val ctx       = compileInternal(inputUnit)
+
+    // Get the resolved logical plan
+    val logicalPlan = inputUnit.resolvedPlan
+
+    // Configure pattern extraction based on options
+    val refactorConfig =
+      if patternOption.aggressive then
+        RefactorConfig.aggressive
+      else if patternOption.conservative then
+        RefactorConfig.conservative
+      else
+        RefactorConfig(
+          minOccurrences = patternOption.minOccurrences,
+          minPatternSize = patternOption.minNodes,
+          maxParameters = patternOption.maxParams
+        )
+
+    val collectorConfig =
+      if patternOption.aggressive then
+        CollectorConfig(minDepth = 1, minNodeCount = 2)
+      else if patternOption.conservative then
+        CollectorConfig(minDepth = 3, minNodeCount = 5)
+      else
+        CollectorConfig(minDepth = 2, minNodeCount = patternOption.minNodes)
+
+    val detectorConfig =
+      if patternOption.aggressive then
+        DetectorConfig.aggressive
+      else if patternOption.conservative then
+        DetectorConfig(minOccurrences = 3, minNodeCount = 5, minDepth = 3)
+      else
+        DetectorConfig(
+          minOccurrences = patternOption.minOccurrences,
+          minNodeCount = patternOption.minNodes
+        )
+
+    val extractorConfig = PatternExtractorConfig(
+      enabled = true,
+      refactorConfig = refactorConfig,
+      collectorConfig = collectorConfig,
+      detectorConfig = detectorConfig,
+      maxSuggestions = patternOption.top
+    )
+
+    // Run pattern extraction
+    val result = PatternExtractor.analyze(logicalPlan, extractorConfig)
+
+    // Output results
+    if patternOption.json then
+      printJsonResult(result)
+    else
+      printTextResult(result, patternOption.top)
+
+  private def printTextResult(result: PatternExtractionResult, topN: Int): Unit =
+    println("=" * 60)
+    println("Pattern Analysis Report")
+    println("=" * 60)
+    println()
+
+    println(s"Summary:")
+    println(s"  - Subtrees analyzed: ${result.detectionResult.totalSubtrees}")
+    println(s"  - Unique patterns: ${result.detectionResult.uniqueHashes}")
+    println(s"  - Duplicate groups: ${result.detectionResult.groups.size}")
+    println(s"  - Actionable suggestions: ${result.suggestions.size}")
+    println(s"  - Total potential reduction: ${result.totalPotentialReduction} nodes")
+    println()
+
+    if result.suggestions.isEmpty then
+      println("No refactoring suggestions found.")
+      println("Try using --aggressive flag for more patterns, or check if the query has repeated structures.")
+    else
+      println(s"Top ${math.min(topN, result.suggestions.size)} Refactoring Suggestions:")
+      println("-" * 60)
+
+      result.suggestions.take(topN).foreach { suggestion =>
+        println()
+        println(s"#${suggestion.rank} ${suggestion.suggestedModelName}")
+        println(s"  Decision: ${suggestion.decision.summary}")
+        println(s"  Occurrences: ${suggestion.group.occurrences}")
+        println(s"  Parameters needed: ${suggestion.parameterCount}")
+
+        if suggestion.group.isCrossQuery then
+          println(s"  Type: Cross-query pattern")
+          println(s"  Sources: ${suggestion.group.sources.mkString(", ")}")
+        else
+          println(s"  Type: Single-query pattern")
+
+        suggestion.unifyResult.foreach { unify =>
+          if unify.variableParameters.nonEmpty then
+            println(s"  Extracted parameters:")
+            unify.variableParameters.foreach { param =>
+              println(s"    - ${param.id}: ${param.inferredType} (${param.distinctValueCount} distinct values)")
+            }
+        }
+
+        if suggestion.decision.warnings.nonEmpty then
+          println(s"  Warnings: ${suggestion.decision.warnings.mkString(", ")}")
+      }
+
+    println()
+    println("=" * 60)
+
+  private def printJsonResult(result: PatternExtractionResult): Unit =
+    import scala.collection.mutable.StringBuilder
+    val json = new StringBuilder
+    json.append("{\n")
+    json.append(s"""  "totalSubtrees": ${result.detectionResult.totalSubtrees},\n""")
+    json.append(s"""  "uniquePatterns": ${result.detectionResult.uniqueHashes},\n""")
+    json.append(s"""  "duplicateGroups": ${result.detectionResult.groups.size},\n""")
+    json.append(s"""  "actionableSuggestions": ${result.suggestions.size},\n""")
+    json.append(s"""  "totalPotentialReduction": ${result.totalPotentialReduction},\n""")
+    json.append("""  "suggestions": [""")
+
+    result.suggestions.zipWithIndex.foreach { case (s, idx) =>
+      if idx > 0 then json.append(",")
+      json.append("\n    {\n")
+      json.append(s"""      "rank": ${s.rank},\n""")
+      json.append(s"""      "modelName": "${s.suggestedModelName}",\n""")
+      json.append(s"""      "score": ${s.decision.score},\n""")
+      json.append(s"""      "occurrences": ${s.group.occurrences},\n""")
+      json.append(s"""      "parameters": ${s.parameterCount},\n""")
+      json.append(s"""      "estimatedReduction": ${s.decision.estimatedReduction},\n""")
+      json.append(s"""      "isCrossQuery": ${s.group.isCrossQuery},\n""")
+      json.append(s"""      "reason": "${s.decision.reason.replace("\"", "\\\"")}"\n""")
+      json.append("    }")
+    }
+
+    json.append("\n  ]\n")
+    json.append("}\n")
+    println(json.toString())
 
 end WvletCompiler

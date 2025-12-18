@@ -97,4 +97,11 @@ class WvletMain(opts: WvletGlobalOption) extends LogSupport:
     }
   }
 
+  @command(description = "Analyze query for refactoring opportunities")
+  def analyze_patterns(compilerOption: WvletCompilerOption, patternOption: PatternAnalysisOption): Unit = handleError {
+    withCompiler(compilerOption) { compiler =>
+      compiler.analyzePatterns(patternOption)
+    }
+  }
+
 end WvletMain
