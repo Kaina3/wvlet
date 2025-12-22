@@ -58,7 +58,13 @@ case class PatternAnalysisOption(
     @option(prefix = "--top", description = "Number of top suggestions to show")
     top: Int = 10,
     @option(prefix = "--json", description = "Output results as JSON")
-    json: Boolean = false
+    json: Boolean = false,
+    @option(prefix = "--dir", description = "Directory of .wv files to analyze (enables cross-query analysis)")
+    dir: Option[String] = None,
+    @option(prefix = "--limit", description = "Limit number of files to analyze from directory")
+    limit: Option[Int] = None,
+    @option(prefix = "--pattern", description = "File pattern to match (default: *.wv)")
+    pattern: String = "*.wv"
 )
 
 class WvletCompiler(
@@ -201,13 +207,136 @@ class WvletCompiler(
     * Analyze the query for duplicate patterns that could be refactored
     */
   def analyzePatterns(patternOption: PatternAnalysisOption): Unit =
-    val inputUnit = getInputUnit(forSQL = false)
-    val ctx       = compileInternal(inputUnit)
+    // Build extraction config from options
+    val extractorConfig = buildExtractorConfig(patternOption)
 
-    // Get the resolved logical plan
+    // Check if directory mode or single file mode
+    patternOption.dir match
+      case Some(dirPath) =>
+        analyzePatternsFromDirectory(dirPath, patternOption, extractorConfig)
+      case None =>
+        analyzePatternsFromSingleFile(patternOption, extractorConfig)
+
+  /**
+    * Analyze patterns from a single file
+    */
+  private def analyzePatternsFromSingleFile(
+      patternOption: PatternAnalysisOption,
+      extractorConfig: PatternExtractorConfig
+  ): Unit =
+    val inputUnit   = getInputUnit(forSQL = false)
+    val ctx         = compileInternal(inputUnit)
     val logicalPlan = inputUnit.resolvedPlan
 
-    // Configure pattern extraction based on options
+    val result = PatternExtractor.analyze(logicalPlan, extractorConfig)
+
+    if patternOption.json then
+      printJsonResult(result, 1)
+    else
+      printTextResult(result, patternOption.top, 1)
+
+  /**
+    * Analyze patterns from multiple files in a directory
+    */
+  private def analyzePatternsFromDirectory(
+      dirPath: String,
+      patternOption: PatternAnalysisOption,
+      extractorConfig: PatternExtractorConfig
+  ): Unit =
+    import java.io.File
+    import java.nio.file.{Files, Paths, FileSystems}
+
+    val dir = new File(dirPath)
+    if !dir.exists() || !dir.isDirectory then
+      throw StatusCode.INVALID_ARGUMENT.newException(s"Directory not found: $dirPath")
+
+    // Find matching files
+    val matcher   = FileSystems.getDefault.getPathMatcher(s"glob:${patternOption.pattern}")
+    val allFiles  = dir.listFiles().filter(f => f.isFile && matcher.matches(Paths.get(f.getName))).toList.sortBy(_.getName)
+    val filesToProcess = patternOption.limit match
+      case Some(n) => allFiles.take(n)
+      case None    => allFiles
+
+    if filesToProcess.isEmpty then
+      println(s"No files matching '${patternOption.pattern}' found in $dirPath")
+      return
+
+    println(s"Analyzing ${filesToProcess.size} files from $dirPath...")
+    println()
+
+    // Compile all files and collect plans
+    val compiler          = createCompiler()
+    var successCount      = 0
+    var failCount         = 0
+    var totalOriginalNodes = 0
+    val plans             = scala.collection.mutable.ListBuffer[(String, wvlet.lang.model.plan.LogicalPlan)]()
+    val failedFiles       = scala.collection.mutable.ListBuffer[(String, String)]()
+    val startTime         = System.currentTimeMillis()
+
+    filesToProcess.zipWithIndex.foreach { case (file, idx) =>
+      if (idx + 1) % 10 == 0 || idx == 0 then
+        print(s"\rProcessing file ${idx + 1}/${filesToProcess.size}...")
+        System.out.flush()
+      try
+        val unit = CompilationUnit.fromFile(file.getAbsolutePath)
+        compiler.compileSingleUnit(unit)
+        val plan = unit.resolvedPlan
+        if plan != null then
+          plans += ((file.getName, plan))
+          totalOriginalNodes += countNodes(plan)
+          successCount += 1
+      catch
+        case e: Exception =>
+          failedFiles += ((file.getName, e.getMessage))
+          failCount += 1
+    }
+
+    val compileTime = System.currentTimeMillis() - startTime
+    println(s"\rCompilation completed in ${compileTime}ms")
+    println(s"Successfully compiled: $successCount files")
+    if failCount > 0 then
+      println(s"Failed to compile: $failCount files")
+      if failedFiles.size <= 10 then
+        failedFiles.foreach { case (name, msg) =>
+          println(s"  - $name: ${msg.take(80)}")
+        }
+      else
+        println(s"  (showing first 5 failures)")
+        failedFiles.take(5).foreach { case (name, msg) =>
+          println(s"  - $name: ${msg.take(80)}")
+        }
+    println(s"Total original nodes: $totalOriginalNodes")
+    println()
+
+    if plans.isEmpty then
+      println("No valid plans to analyze")
+      return
+
+    println("Running cross-query pattern analysis...")
+    val analysisStartTime = System.currentTimeMillis()
+
+    // Run cross-query analysis
+    val result = PatternExtractor.analyzeMultiple(plans.toList, extractorConfig)
+
+    val analysisTime = System.currentTimeMillis() - analysisStartTime
+    println(s"Analysis completed in ${analysisTime}ms")
+    println()
+
+    if patternOption.json then
+      printJsonResult(result, plans.size, Some(totalOriginalNodes))
+    else
+      printTextResult(result, patternOption.top, plans.size, Some(totalOriginalNodes))
+
+  /**
+    * Count nodes in a LogicalPlan tree
+    */
+  private def countNodes(plan: wvlet.lang.model.plan.LogicalPlan): Int =
+    1 + plan.children.map(countNodes).sum
+
+  /**
+    * Build PatternExtractorConfig from options
+    */
+  private def buildExtractorConfig(patternOption: PatternAnalysisOption): PatternExtractorConfig =
     val refactorConfig =
       if patternOption.aggressive then
         RefactorConfig.aggressive
@@ -239,35 +368,41 @@ class WvletCompiler(
           minNodeCount = patternOption.minNodes
         )
 
-    val extractorConfig = PatternExtractorConfig(
+    PatternExtractorConfig(
       enabled = true,
       refactorConfig = refactorConfig,
       collectorConfig = collectorConfig,
       detectorConfig = detectorConfig,
-      maxSuggestions = patternOption.top
+      maxSuggestions = patternOption.top,
+      crossQueryAnalysis = patternOption.dir.isDefined
     )
 
-    // Run pattern extraction
-    val result = PatternExtractor.analyze(logicalPlan, extractorConfig)
-
-    // Output results
-    if patternOption.json then
-      printJsonResult(result)
-    else
-      printTextResult(result, patternOption.top)
-
-  private def printTextResult(result: PatternExtractionResult, topN: Int): Unit =
+  private def printTextResult(
+      result: PatternExtractionResult,
+      topN: Int,
+      fileCount: Int,
+      totalOriginalNodes: Option[Int] = None
+  ): Unit =
     println("=" * 60)
     println("Pattern Analysis Report")
     println("=" * 60)
     println()
 
     println(s"Summary:")
+    println(s"  - Files analyzed: $fileCount")
+    totalOriginalNodes.foreach { total =>
+      println(s"  - Total original nodes: $total")
+    }
     println(s"  - Subtrees analyzed: ${result.detectionResult.totalSubtrees}")
     println(s"  - Unique patterns: ${result.detectionResult.uniqueHashes}")
     println(s"  - Duplicate groups: ${result.detectionResult.groups.size}")
     println(s"  - Actionable suggestions: ${result.suggestions.size}")
     println(s"  - Total potential reduction: ${result.totalPotentialReduction} nodes")
+    totalOriginalNodes.foreach { total =>
+      if total > 0 then
+        val reductionPct = (result.totalPotentialReduction.toDouble / total) * 100
+        println(f"  - Overall reduction rate: $reductionPct%.2f%%")
+    }
     println()
 
     if result.suggestions.isEmpty then
@@ -305,15 +440,28 @@ class WvletCompiler(
     println()
     println("=" * 60)
 
-  private def printJsonResult(result: PatternExtractionResult): Unit =
+  private def printJsonResult(
+      result: PatternExtractionResult,
+      fileCount: Int,
+      totalOriginalNodes: Option[Int] = None
+  ): Unit =
     import scala.collection.mutable.StringBuilder
     val json = new StringBuilder
     json.append("{\n")
+    json.append(s"""  "filesAnalyzed": $fileCount,\n""")
+    totalOriginalNodes.foreach { total =>
+      json.append(s"""  "totalOriginalNodes": $total,\n""")
+    }
     json.append(s"""  "totalSubtrees": ${result.detectionResult.totalSubtrees},\n""")
     json.append(s"""  "uniquePatterns": ${result.detectionResult.uniqueHashes},\n""")
     json.append(s"""  "duplicateGroups": ${result.detectionResult.groups.size},\n""")
     json.append(s"""  "actionableSuggestions": ${result.suggestions.size},\n""")
     json.append(s"""  "totalPotentialReduction": ${result.totalPotentialReduction},\n""")
+    totalOriginalNodes.foreach { total =>
+      if total > 0 then
+        val reductionPct = (result.totalPotentialReduction.toDouble / total) * 100
+        json.append(f"""  "overallReductionRate": $reductionPct%.4f,\n""")
+    }
     json.append("""  "suggestions": [""")
 
     result.suggestions.zipWithIndex.foreach { case (s, idx) =>
