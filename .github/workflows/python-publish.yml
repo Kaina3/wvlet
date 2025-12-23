@@ -139,7 +139,7 @@ jobs:
         run: ls -la sdks/python/dist/
       
       - name: Upload artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: python-distributions
           path: sdks/python/dist/
@@ -173,7 +173,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       
       - name: Download built wheels
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: python-distributions
           path: dist/
@@ -225,7 +225,7 @@ jobs:
       id-token: write  # For PyPI trusted publishing
     steps:
       - name: Download built distributions
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: python-distributions
           path: dist/

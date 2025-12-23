@@ -15,12 +15,12 @@
     "build-vscode-extension": "npm run package --workspace=vscode-wvlet"
   },
   "dependencies": {
-    "@duckdb/duckdb-wasm": "^1.30.0",
+    "@duckdb/duckdb-wasm": "^1.32.0",
     "@tailwindcss/postcss": "^4.1.18",
     "@tailwindcss/vite": "^4.1.18",
     "apache-arrow": "^21.1.0",
     "monaco-editor": "^0.55.1",
-    "rollup": "^4.53.5"
+    "rollup": "^4.54.0"
   },
   "devDependencies": {
     "@rollup/plugin-replace": "^6.0.3",
