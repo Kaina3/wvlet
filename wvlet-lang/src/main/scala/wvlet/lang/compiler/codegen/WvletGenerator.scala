@@ -211,6 +211,20 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
         unary(o, "offset", o.rows)
       case c: Count =>
         unary(c, "count", Nil)
+      case m: ModelScan =>
+        // ModelScan: reference to a defined model with arguments
+        code(m) {
+          val modelName = text(m.name.fullName)
+          val args =
+            if m.modelArgs.isEmpty then
+              empty
+            else
+              paren(cl(m.modelArgs.map(arg => expr(arg))))
+          if sc.inFromClause then
+            modelName + args
+          else
+            group(text("from") + ws + modelName + args)
+        }
       case t: TableInput =>
         code(t) {
           if sc.inFromClause then

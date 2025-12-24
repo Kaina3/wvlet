@@ -19,6 +19,7 @@ import wvlet.lang.compiler.Phase
 import wvlet.lang.compiler.Symbol
 import wvlet.lang.compiler.WorkEnv
 import wvlet.lang.compiler.analyzer.refactor.*
+import wvlet.lang.model.plan.LogicalPlan
 import wvlet.lang.runner.QueryExecutor
 import wvlet.lang.runner.connector.DBConnector
 import wvlet.lang.runner.connector.DBConnectorProvider
@@ -59,7 +60,10 @@ case class PatternAnalysisOption(
     top: Int = 10,
     @option(prefix = "--json", description = "Output results as JSON")
     json: Boolean = false,
-    @option(prefix = "-o,--output", description = "Output file path (stdout if not specified)")
+    @option(
+      prefix = "-o,--output",
+      description = "Output file path (stdout if not specified). If --apply is set, writes refactored code; otherwise writes the analysis report"
+    )
     output: Option[String] = None,
     @option(
       prefix = "--parse-only",
@@ -73,7 +77,13 @@ case class PatternAnalysisOption(
     @option(prefix = "--limit", description = "Limit number of files to analyze from directory")
     limit: Option[Int] = None,
     @option(prefix = "--pattern", description = "File pattern to match (default: *.wv)")
-    pattern: String = "*.wv"
+    pattern: String = "*.wv",
+    @option(prefix = "--apply", description = "Apply top suggestions and output refactored Wvlet code")
+    apply: Boolean = false,
+    @option(prefix = "--apply-top", description = "Number of top suggestions to apply (default: 1)")
+    applyTop: Int = 1,
+    @option(prefix = "--model-prefix", description = "Prefix for generated model names (default: auto)")
+    modelPrefix: String = "auto"
 )
 
 class WvletCompiler(
@@ -109,10 +119,13 @@ class WvletCompiler(
   override def close(): Unit = Option(_dbConnector).foreach(_.close())
 
   private def createCompiler(parseOnly: Boolean = false): Compiler =
+    createCompiler(parseOnly = parseOnly, sourceFolders = List(compilerOption.workFolder))
+
+  private def createCompiler(parseOnly: Boolean, sourceFolders: List[String]): Compiler =
     val dbType = compilerOption.targetDBType.map(DBType.fromString).getOrElse(currentProfile.dbType)
 
     val options = CompilerOptions(
-      sourceFolders = List(compilerOption.workFolder),
+      sourceFolders = sourceFolders,
       workEnv = workEnv,
       catalog = currentProfile.catalog,
       schema = currentProfile.schema,
@@ -157,13 +170,18 @@ class WvletCompiler(
   private def compile(inputUnit: CompilationUnit): CompileResult = createCompiler()
     .compileSingleUnit(inputUnit)
 
-  private def compileInternal(inputUnit: CompilationUnit, parseOnly: Boolean = false): Context =
+  private def compileInternal(
+      inputUnit: CompilationUnit,
+      parseOnly: Boolean = false,
+      sourceFolders: List[String] = List(compilerOption.workFolder)
+  ): Context =
     val compileResult =
       if parseOnly then
-        val parsingCompiler = createCompiler(parseOnly = true)
+        val parsingCompiler = createCompiler(parseOnly = true, sourceFolders = sourceFolders)
         parsingCompiler.compileSingleUnit(inputUnit)
       else
-        compile(inputUnit)
+        val compiler = createCompiler(parseOnly = false, sourceFolders = sourceFolders)
+        compiler.compileSingleUnit(inputUnit)
 
     compileResult.reportAllErrors
 
@@ -222,9 +240,45 @@ class WvletCompiler(
     // Check if directory mode or single file mode
     patternOption.dir match
       case Some(dirPath) =>
-        analyzePatternsFromDirectory(dirPath, patternOption, extractorConfig)
+        import java.io.File
+        val f = new File(dirPath)
+        if f.exists && f.isFile then
+          // Accept a file path passed to --dir for convenience
+          analyzePatternsFromFilePath(dirPath, patternOption, extractorConfig)
+        else
+          analyzePatternsFromDirectory(dirPath, patternOption, extractorConfig)
       case None =>
         analyzePatternsFromSingleFile(patternOption, extractorConfig)
+
+  /**
+    * Analyze patterns from an explicit file path (used when --dir is given a file)
+    */
+  private def analyzePatternsFromFilePath(
+      filePath: String,
+      patternOption: PatternAnalysisOption,
+      extractorConfig: PatternExtractorConfig
+  ): Unit =
+    import java.nio.file.Paths
+
+    val p            = Paths.get(filePath)
+    val resolvedPath = if p.isAbsolute then filePath else s"${compilerOption.workFolder}/${filePath}".stripPrefix("./")
+    val inputUnit   = CompilationUnit.fromFile(resolvedPath)
+    // In single-file analysis, do not scan source folders at all.
+    // Otherwise, other .wv files in the same directory can break compilation.
+    val ctx         = compileInternal(inputUnit, parseOnly = patternOption.parseOnly, sourceFolders = Nil)
+    val logicalPlan = inputUnit.resolvedPlan
+
+    val result = PatternExtractor.analyze(logicalPlan, extractorConfig)
+
+    if patternOption.apply then
+      applyAndOutputRefactoring(logicalPlan, result, patternOption, ctx)
+    else
+      val output = if patternOption.json then
+        formatJsonResult(result, 1)
+      else
+        formatTextResult(result, patternOption.top, 1)
+
+      writeOutput(output, patternOption.output)
 
   /**
     * Analyze patterns from a single file
@@ -234,17 +288,80 @@ class WvletCompiler(
       extractorConfig: PatternExtractorConfig
   ): Unit =
     val inputUnit   = getInputUnit(forSQL = false)
-    val ctx         = compileInternal(inputUnit, parseOnly = patternOption.parseOnly)
+    // In single-file analysis, compile only this unit (no folder scanning)
+    val ctx         = compileInternal(inputUnit, parseOnly = patternOption.parseOnly, sourceFolders = Nil)
     val logicalPlan = inputUnit.resolvedPlan
 
     val result = PatternExtractor.analyze(logicalPlan, extractorConfig)
 
-    val output = if patternOption.json then
-      formatJsonResult(result, 1)
+    // Check if we should apply refactorings
+    if patternOption.apply then
+      applyAndOutputRefactoring(logicalPlan, result, patternOption, ctx)
     else
-      formatTextResult(result, patternOption.top, 1)
+      val output = if patternOption.json then
+        formatJsonResult(result, 1)
+      else
+        formatTextResult(result, patternOption.top, 1)
 
-    writeOutput(output, patternOption.output)
+      writeOutput(output, patternOption.output)
+
+  /**
+    * Apply refactoring suggestions and output the transformed Wvlet code
+    */
+  private def applyAndOutputRefactoring(
+      originalPlan: LogicalPlan,
+      extraction: PatternExtractionResult,
+      patternOption: PatternAnalysisOption,
+      ctx: Context
+  ): Unit =
+    import wvlet.lang.compiler.codegen.{WvletGenerator, CodeFormatterConfig}
+
+    // Configure the applier
+    val applyConfig = ApplyConfig(
+      topK = patternOption.applyTop,
+      useOptimalSuggestions = true,
+      modelNamePrefix = patternOption.modelPrefix,
+      skipIfOverlaps = true,
+      requireVariableParams = true
+    )
+
+    // Apply refactorings
+    val applyResult = RefactoringApplier.applyRefactorings(originalPlan, extraction, applyConfig)
+
+    if !applyResult.hasChanges then
+      println("// No refactorings applied (no applicable suggestions found)")
+      println()
+      // Still output original code
+      val config    = CodeFormatterConfig(sqlDBType = ctx.dbType)
+      val generator = WvletGenerator(config)(using ctx)
+      val output    = generator.print(originalPlan)
+      writeOutput(output, patternOption.output)
+      return
+
+    // Generate Wvlet code from the transformed plan
+    val config    = CodeFormatterConfig(sqlDBType = ctx.dbType)
+    val generator = WvletGenerator(config)(using ctx)
+    val output    = generator.print(applyResult.updatedPlan)
+
+    // Add header comment with refactoring summary
+    val header = new StringBuilder
+    header.append(s"// Auto-refactored by Wvlet Pattern Analyzer\n")
+    header.append(s"// Applied ${applyResult.applied.size} refactoring(s)\n")
+    header.append(s"// Total occurrences replaced: ${applyResult.totalOccurrencesReplaced}\n")
+    header.append(s"// Estimated node reduction: ${applyResult.totalNodeReduction}\n")
+    header.append("//\n")
+    applyResult.applied.foreach { applied =>
+      header.append(s"// - ${applied.suggestionId}: ${applied.occurrencesReplaced} occurrences\n")
+    }
+    if applyResult.skipped.nonEmpty then
+      header.append("// Skipped:\n")
+      applyResult.skipped.foreach { skipped =>
+        header.append(s"//   - ${skipped.suggestionId}: ${skipped.reason}\n")
+      }
+    header.append("\n")
+
+    val fullOutput = header.toString + output
+    writeOutput(fullOutput, patternOption.output)
 
   /**
     * Analyze patterns from multiple files in a directory
@@ -281,7 +398,7 @@ class WvletCompiler(
     // Compile all files and collect plans
     // NOTE: Even Compiler.parseOnly still parses *all* units in sourceFolders.
     // For bulk directory checks, we want a fast path that parses only the target file.
-    val compiler          = if patternOption.parseOnly then null else createCompiler(parseOnly = false)
+    val compiler          = if patternOption.parseOnly then null else createCompiler(parseOnly = false, sourceFolders = List(dirPath))
     var successCount      = 0
     var failCount         = 0
     var totalOriginalNodes = 0
