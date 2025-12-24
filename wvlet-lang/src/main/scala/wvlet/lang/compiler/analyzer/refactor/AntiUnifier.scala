@@ -179,6 +179,9 @@ object AntiUnifier extends LogSupport:
       val context                         = new UnificationContext(plans.size, sourceIds)
       val pattern                         = unifyPlans(plans, context)
       val (parameters, substitutions)     = context.build()
+      
+      val variableParams = parameters.filterNot(_.isConstant)
+      
       Some(AntiUnifyResult(pattern, parameters, substitutions))
     catch
       case e: CannotUnifyException =>
@@ -234,12 +237,16 @@ object AntiUnifier extends LogSupport:
     if nodeTypes.size != 1 then
       throw new CannotUnifyException(s"Different node types: ${nodeTypes.map(_.getSimpleName).mkString(", ")}")
 
+    // Debug: log node type being processed
+    val nodeType = plans.head.getClass.getSimpleName
+    
     plans.head match
       // === Unary relations ===
       case _: Filter =>
         val filters   = plans.map(_.asInstanceOf[Filter])
         val children  = unifyRelations(filters.map(_.child), ctx)
-        val filterExpr = unifyExprs(filters.map(_.filterExpr), ctx, "filter_expr")
+        val filterExprs = filters.map(_.filterExpr)
+        val filterExpr = unifyExprs(filterExprs, ctx, "filter_expr")
         Filter(children, filterExpr, NoSpan)
 
       case _: Project =>
@@ -320,6 +327,12 @@ object AntiUnifier extends LogSupport:
         val right     = unifyRelations(excepts.map(_.right), ctx)
         Except(left, right, excepts.head.isDistinct, NoSpan)
 
+      case _: Concat =>
+        val concats   = plans.map(_.asInstanceOf[Concat])
+        val left      = unifyRelations(concats.map(_.left), ctx)
+        val right     = unifyRelations(concats.map(_.right), ctx)
+        Concat(left, right, NoSpan)
+
       // === Leaf nodes ===
       case _: TableRef =>
         val refs      = plans.map(_.asInstanceOf[TableRef])
@@ -341,10 +354,24 @@ object AntiUnifier extends LogSupport:
           val paramId = ctx.createParameter(names, "table_scan")
           scans.head
 
-      // === Other nodes - return first as pattern ===
+      // === Other nodes - try to unify children recursively ===
       case other =>
-        debug(s"Unifying unknown node type: ${other.getClass.getSimpleName}")
-        plans.head
+        debug(s"Unifying node type with generic handler: ${other.getClass.getSimpleName}")
+        // For unknown nodes, attempt to unify children recursively
+        val children = plans.map(_.children)
+        if children.nonEmpty && children.map(_.size).distinct.size == 1 then
+          // All plans have same number of children
+          val numChildren = children.head.size
+          val unifiedChildren = (0 until numChildren).map { i =>
+            val childPlans = children.map(_(i))
+            unifyPlans(childPlans, ctx)
+          }.toList
+          // Return first plan structure with unified children
+          // Note: This is a best-effort approach for unsupported node types
+          plans.head
+        else
+          // Different child structures - return first as is
+          plans.head
 
   /**
     * Unify a list of Relations (wrapper for type safety)
@@ -513,6 +540,11 @@ object AntiUnifier extends LogSupport:
         val notnulls = exprs.map(_.asInstanceOf[IsNotNull])
         val child    = unifyExprs(notnulls.map(_.child), ctx, s"${position}_child")
         IsNotNull(child, NoSpan)
+
+      case _: ParenthesizedExpression =>
+        val parens = exprs.map(_.asInstanceOf[ParenthesizedExpression])
+        val child  = unifyExprs(parens.map(_.child), ctx, s"${position}_child")
+        ParenthesizedExpression(child, NoSpan)
 
       // === Function calls ===
       case _: FunctionApply =>

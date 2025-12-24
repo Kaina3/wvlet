@@ -198,7 +198,10 @@ object DuplicateDetector extends LogSupport:
       config: DetectorConfig = DetectorConfig.default,
       collectorConfig: CollectorConfig = CollectorConfig.default
   ): DuplicateDetectionResult =
+    val t0 = System.currentTimeMillis()
     val subtrees = SubtreeCollector.collectFromMultiple(plans, collectorConfig)
+    val t1 = System.currentTimeMillis()
+    println(s"    [DuplicateDetector] Subtree collection: ${t1 - t0}ms (${subtrees.size} subtrees)")
     detectFromSubtrees(subtrees, config)
 
   /**
@@ -209,19 +212,30 @@ object DuplicateDetector extends LogSupport:
       config: DetectorConfig
   ): DuplicateDetectionResult =
     // Filter by minimum criteria
+    val t0 = System.currentTimeMillis()
     val filtered = subtrees.filter { s =>
       s.nodeCount >= config.minNodeCount && s.depth >= config.minDepth
     }
+    val t1 = System.currentTimeMillis()
+    println(s"    [DuplicateDetector] Filtering: ${t1 - t0}ms (${filtered.size} remain)")
 
     // Group by structural hash
+    val t2 = System.currentTimeMillis()
     val grouped = SubtreeCollector.groupByHash(filtered, config.minOccurrences)
+    val t3 = System.currentTimeMillis()
+    println(s"    [DuplicateDetector] Hash grouping: ${t3 - t2}ms (${grouped.size} groups)")
 
     // Apply cross-query filter if required
+    val t4 = System.currentTimeMillis()
     val filtered2 =
       if config.requireCrossQuery then SubtreeCollector.filterCrossSource(grouped)
       else grouped
+    val t5 = System.currentTimeMillis()
+    if config.requireCrossQuery then
+      println(s"    [DuplicateDetector] Cross-query filter: ${t5 - t4}ms (${filtered2.size} groups)")
 
     // Remove overlapping subtrees within each group
+    val t6 = System.currentTimeMillis()
     val cleaned =
       if config.removeOverlapping then
         filtered2.map { case (hash, subs) =>
@@ -229,8 +243,11 @@ object DuplicateDetector extends LogSupport:
         }.filter(_._2.size >= config.minOccurrences)
       else
         filtered2
+    val t7 = System.currentTimeMillis()
+    println(s"    [DuplicateDetector] Remove overlapping: ${t7 - t6}ms (${cleaned.size} groups)")
 
     // Create duplicate groups
+    val t8 = System.currentTimeMillis()
     val groups = cleaned.map { case (hash, subs) =>
       DuplicateGroup(
         structuralHash = hash,
@@ -239,6 +256,8 @@ object DuplicateDetector extends LogSupport:
         depth = subs.map(_.depth).sum.toDouble / subs.size
       )
     }.toList
+    val t9 = System.currentTimeMillis()
+    println(s"    [DuplicateDetector] Group creation: ${t9 - t8}ms")
 
     DuplicateDetectionResult(
       groups = groups,

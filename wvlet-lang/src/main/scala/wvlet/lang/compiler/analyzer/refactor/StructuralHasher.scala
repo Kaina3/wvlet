@@ -26,6 +26,7 @@ import scala.util.hashing.MurmurHash3
   *   If true, literal values are ignored (treated as wildcards)
   * @param ignoreIdentifiers
   *   If true, identifier names are ignored (treated as wildcards)
+  *   This allows detecting patterns with different column names as duplicates
   * @param ignoreAliases
   *   If true, alias names are ignored
   * @param normalizeCommutative
@@ -33,7 +34,7 @@ import scala.util.hashing.MurmurHash3
   */
 case class HashConfig(
     ignoreLiterals: Boolean = true,
-    ignoreIdentifiers: Boolean = false,
+    ignoreIdentifiers: Boolean = true,  // Changed to true: treat different column names as same pattern
     ignoreAliases: Boolean = true,
     normalizeCommutative: Boolean = true
 )
@@ -47,6 +48,15 @@ object HashConfig:
     ignoreIdentifiers = false,
     ignoreAliases = false,
     normalizeCommutative = false
+  )
+
+  // For pattern detection with column name sensitivity
+  // Use this when you want different column names to be separate patterns
+  val columnSensitive: HashConfig = HashConfig(
+    ignoreLiterals = true,
+    ignoreIdentifiers = false,
+    ignoreAliases = true,
+    normalizeCommutative = true
   )
 
 /**

@@ -108,12 +108,18 @@ end RefactoringDecision
   *   The refactoring decision
   * @param rank
   *   Rank among all suggestions (1 = best)
+  * @param subsumedBy
+  *   If this suggestion is contained within another suggestion (parent hash)
+  * @param subsumes
+  *   List of suggestion hashes that this suggestion contains (children)
   */
 case class RefactoringSuggestion(
     group: DuplicateGroup,
     unifyResult: Option[AntiUnifyResult],
     decision: RefactoringDecision,
-    rank: Int = 0
+    rank: Int = 0,
+    subsumedBy: Option[Int] = None,
+    subsumes: List[Int] = Nil
 ):
   /**
     * Generate a suggested model name
@@ -127,7 +133,43 @@ case class RefactoringSuggestion(
     */
   def parameterCount: Int = unifyResult.map(_.variableParameters.size).getOrElse(0)
 
+  /**
+    * Whether this is an optimal (root-level) suggestion not subsumed by another
+    */
+  def isOptimal: Boolean = subsumedBy.isEmpty
+
 end RefactoringSuggestion
+
+/**
+  * Result of hierarchical suggestion analysis with optimal selections
+  *
+  * @param allSuggestions
+  *   All actionable suggestions with hierarchy info
+  * @param optimalSuggestions
+  *   Only the optimal (root-level) suggestions for modeling
+  * @param totalReductionAll
+  *   Total reduction if all suggestions were applied (may double-count)
+  * @param totalReductionOptimal
+  *   Total reduction from optimal suggestions (no double-counting)
+  */
+case class HierarchicalSuggestionResult(
+    allSuggestions: List[RefactoringSuggestion],
+    optimalSuggestions: List[RefactoringSuggestion],
+    totalReductionAll: Int,
+    totalReductionOptimal: Int
+):
+  /**
+    * Summary of the hierarchical analysis
+    */
+  def summary: String =
+    s"""Hierarchical Analysis:
+       |  - Total actionable suggestions: ${allSuggestions.size}
+       |  - Optimal suggestions (for modeling): ${optimalSuggestions.size}
+       |  - Reduction (all, may overlap): $totalReductionAll nodes
+       |  - Reduction (optimal, no overlap): $totalReductionOptimal nodes
+       |  - Subsumed suggestions: ${allSuggestions.count(_.subsumedBy.isDefined)}""".stripMargin
+
+end HierarchicalSuggestionResult
 
 /**
   * Decides whether duplicate patterns should be refactored into models
@@ -142,28 +184,28 @@ object RefactoringDecider extends LogSupport:
     * @param config
     *   Refactoring configuration
     * @return
-    *   RefactoringDecision
+    *   (RefactoringDecision, Option[AntiUnifyResult]) - decision and unify result if computed
     */
-  def evaluate(group: DuplicateGroup, config: RefactorConfig = RefactorConfig.default): RefactoringDecision =
+  def evaluate(group: DuplicateGroup, config: RefactorConfig = RefactorConfig.default): (RefactoringDecision, Option[AntiUnifyResult]) =
     val warnings = scala.collection.mutable.ListBuffer[String]()
 
     // Check minimum occurrences
     if group.occurrences < config.minOccurrences then
-      return RefactoringDecision(
+      return (RefactoringDecision(
         shouldRefactor = false,
         reason = s"Occurrences (${group.occurrences}) < minimum (${config.minOccurrences})",
         score = 0.0,
         estimatedReduction = 0
-      )
+      ), None)
 
     // Check minimum pattern size
     if group.nodeCount < config.minPatternSize then
-      return RefactoringDecision(
+      return (RefactoringDecision(
         shouldRefactor = false,
         reason = s"Pattern size (${group.nodeCount.toInt}) < minimum (${config.minPatternSize})",
         score = 0.0,
         estimatedReduction = 0
-      )
+      ), None)
 
     // Try anti-unification to get parameter count
     val unifyResult = AntiUnifier.unify(group)
@@ -171,13 +213,13 @@ object RefactoringDecider extends LogSupport:
 
     // Check parameter count
     if paramCount > config.maxParameters then
-      return RefactoringDecision(
+      return (RefactoringDecision(
         shouldRefactor = false,
         reason = s"Too many parameters ($paramCount > ${config.maxParameters})",
         score = 0.0,
         estimatedReduction = 0,
         warnings = List("Consider breaking down the pattern")
-      )
+      ), unifyResult)
 
     // Calculate reduction
     val originalNodes   = (group.nodeCount * group.occurrences).toInt
@@ -189,21 +231,21 @@ object RefactoringDecider extends LogSupport:
 
     // Check minimum reduction
     if reduction < config.minReduction then
-      return RefactoringDecision(
+      return (RefactoringDecision(
         shouldRefactor = false,
         reason = s"Reduction ($reduction) < minimum (${config.minReduction})",
         score = 0.0,
         estimatedReduction = reduction
-      )
+      ), unifyResult)
 
     // Check minimum reduction ratio
     if reductionRatio < config.minReductionRatio then
-      return RefactoringDecision(
+      return (RefactoringDecision(
         shouldRefactor = false,
         reason = f"Reduction ratio (${reductionRatio * 100}%.1f%%) < minimum (${config.minReductionRatio * 100}%.0f%%)",
         score = 0.0,
         estimatedReduction = reduction
-      )
+      ), unifyResult)
 
     // Add warnings for edge cases
     if paramCount == 0 then
@@ -218,13 +260,13 @@ object RefactoringDecider extends LogSupport:
     // Calculate score
     val score = calculateScore(group, reduction, reductionRatio, paramCount, config)
 
-    RefactoringDecision(
+    (RefactoringDecision(
       shouldRefactor = true,
       reason = f"${group.occurrences} occurrences, $reduction node reduction (${reductionRatio * 100}%.0f%%)",
       score = score,
       estimatedReduction = reduction,
       warnings = warnings.toList
-    )
+    ), unifyResult)
 
   /**
     * Calculate refactoring score for ranking
@@ -272,8 +314,7 @@ object RefactoringDecider extends LogSupport:
       config: RefactorConfig = RefactorConfig.default
   ): List[RefactoringSuggestion] =
     val suggestions = result.groups.map { group =>
-      val decision    = evaluate(group, config)
-      val unifyResult = if decision.shouldRefactor then AntiUnifier.unify(group) else None
+      val (decision, unifyResult) = evaluate(group, config)
       RefactoringSuggestion(group, unifyResult, decision)
     }
 
@@ -341,6 +382,221 @@ object RefactoringDecider extends LogSupport:
        |
        |Top Suggestions:
        |${suggestions.take(10).map(s => s"  ${s.rank}. ${s.suggestedModelName}: ${s.decision.summary}").mkString("\n")}
+       |""".stripMargin
+
+  // ============================================================================
+  // Hierarchical Analysis: Detect and handle nested suggestions
+  // ============================================================================
+
+  /**
+    * Analyze suggestions hierarchically to find optimal modeling targets.
+    * 
+    * When multiple suggestions have containment relationships (e.g., a Project node
+    * is inside an AliasedRelation), this method identifies which level is optimal
+    * for modeling to avoid redundant/overlapping refactorings.
+    *
+    * @param result
+    *   Detection result containing all duplicate groups
+    * @param config
+    *   Refactoring configuration
+    * @return
+    *   HierarchicalSuggestionResult with both all suggestions and optimal ones
+    */
+  def evaluateHierarchically(
+      result: DuplicateDetectionResult,
+      config: RefactorConfig = RefactorConfig.default
+  ): HierarchicalSuggestionResult =
+    // First, get all actionable suggestions
+    val baseSuggestions = result.groups.map { group =>
+      val (decision, unifyResult) = evaluate(group, config)
+      RefactoringSuggestion(group, unifyResult, decision)
+    }.filter(_.decision.shouldRefactor)
+
+    if baseSuggestions.isEmpty then
+      return HierarchicalSuggestionResult(Nil, Nil, 0, 0)
+
+    // Build containment relationships between suggestions
+    val withHierarchy = buildHierarchy(baseSuggestions)
+
+    // Sort by score and assign ranks
+    val sorted = withHierarchy.sortBy(-_.decision.score)
+    val ranked = sorted.zipWithIndex.map { case (s, idx) =>
+      s.copy(rank = idx + 1)
+    }
+
+    // Extract optimal suggestions (those not subsumed by any other)
+    val optimal = ranked.filter(_.isOptimal).sortBy(-_.decision.score)
+    val optimalReranked = optimal.zipWithIndex.map { case (s, idx) =>
+      s.copy(rank = idx + 1)
+    }
+
+    val totalAll = ranked.map(_.decision.estimatedReduction).sum
+    val totalOptimal = optimalReranked.map(_.decision.estimatedReduction).sum
+
+    HierarchicalSuggestionResult(
+      allSuggestions = ranked,
+      optimalSuggestions = optimalReranked,
+      totalReductionAll = totalAll,
+      totalReductionOptimal = totalOptimal
+    )
+
+  /**
+    * Build containment hierarchy between suggestions.
+    *
+    * For each source (query), we check if subtrees of one suggestion are
+    * descendants of subtrees of another suggestion. If ALL subtrees of
+    * suggestion A (within a source) are descendants of subtrees in suggestion B,
+    * then A is "subsumed by" B.
+    */
+  private def buildHierarchy(
+      suggestions: List[RefactoringSuggestion]
+  ): List[RefactoringSuggestion] =
+    if suggestions.size <= 1 then
+      return suggestions
+
+    // Group subtrees by source for each suggestion
+    val suggestionsByHash = suggestions.map(s => s.group.structuralHash -> s).toMap
+
+    // For each pair of suggestions, check containment
+    val subsumptionMap = scala.collection.mutable.Map[Int, Option[Int]]()  // child hash -> parent hash
+    val childrenMap = scala.collection.mutable.Map[Int, List[Int]]().withDefaultValue(Nil)  // parent hash -> child hashes
+
+    for
+      s1 <- suggestions
+      s2 <- suggestions
+      if s1.group.structuralHash != s2.group.structuralHash
+    do
+      if isSubsumedBy(s1.group, s2.group) then
+        // s1 is contained within s2
+        val childHash = s1.group.structuralHash
+        val parentHash = s2.group.structuralHash
+        
+        // Only record if this is a more direct parent (smaller pattern preferred as parent)
+        // or if no parent is recorded yet
+        subsumptionMap.get(childHash) match
+          case None =>
+            subsumptionMap(childHash) = Some(parentHash)
+            childrenMap(parentHash) = childHash :: childrenMap(parentHash)
+          case Some(existingParent) =>
+            // Prefer the smaller (more immediate) parent
+            val existingParentGroup = suggestionsByHash.get(existingParent.get).map(_.group)
+            val newParentGroup = suggestionsByHash.get(parentHash).map(_.group)
+            (existingParentGroup, newParentGroup) match
+              case (Some(ep), Some(np)) if np.nodeCount < ep.nodeCount =>
+                // New parent is smaller (more immediate), use it instead
+                childrenMap(existingParent.get) = childrenMap(existingParent.get).filterNot(_ == childHash)
+                subsumptionMap(childHash) = Some(parentHash)
+                childrenMap(parentHash) = childHash :: childrenMap(parentHash)
+              case _ => // Keep existing parent
+
+    // Build updated suggestions with hierarchy info
+    suggestions.map { s =>
+      val hash = s.group.structuralHash
+      s.copy(
+        subsumedBy = subsumptionMap.get(hash).flatten,
+        subsumes = childrenMap(hash)
+      )
+    }
+
+  /**
+    * Check if group1's subtrees are all contained within group2's subtrees.
+    *
+    * For this to be true, for each source that appears in both groups,
+    * every subtree from group1 must be a descendant of some subtree in group2.
+    */
+  private def isSubsumedBy(group1: DuplicateGroup, group2: DuplicateGroup): Boolean =
+    // Group subtrees by sourceId
+    val bySource1 = group1.subtrees.groupBy(_.sourceId)
+    val bySource2 = group2.subtrees.groupBy(_.sourceId)
+
+    // Find common sources
+    val commonSources = bySource1.keySet.intersect(bySource2.keySet)
+    
+    if commonSources.isEmpty then
+      return false
+
+    // For each common source, check if all group1 subtrees are descendants of group2 subtrees
+    commonSources.forall { source =>
+      val subtrees1 = bySource1(source)
+      val subtrees2 = bySource2(source)
+
+      subtrees1.forall { st1 =>
+        subtrees2.exists { st2 =>
+          st1.isDescendantOf(st2)
+        }
+      }
+    }
+
+  /**
+    * Get optimal refactoring suggestions (hierarchically filtered)
+    */
+  def getOptimalSuggestions(
+      result: DuplicateDetectionResult,
+      topN: Int = 10,
+      config: RefactorConfig = RefactorConfig.default
+  ): List[RefactoringSuggestion] =
+    evaluateHierarchically(result, config).optimalSuggestions.take(topN)
+
+  /**
+    * Print hierarchical analysis results
+    */
+  def printHierarchicalSuggestions(hierarchyResult: HierarchicalSuggestionResult): Unit =
+    if hierarchyResult.allSuggestions.isEmpty then
+      info("No refactoring suggestions")
+      return
+
+    info(hierarchyResult.summary)
+    info("")
+    info("=== Optimal Suggestions (for modeling) ===")
+    info("")
+
+    hierarchyResult.optimalSuggestions.foreach { s =>
+      val childInfo = if s.subsumes.nonEmpty then
+        s"\n  Contains: ${s.subsumes.size} nested patterns"
+      else ""
+      info(s"""
+        |#${s.rank} ${s.suggestedModelName}
+        |  ${s.decision.summary}
+        |  Occurrences: ${s.group.occurrences}
+        |  Parameters: ${s.parameterCount}
+        |  Sources: ${s.group.sources.mkString(", ")}$childInfo
+        |""".stripMargin)
+    }
+
+    val subsumed = hierarchyResult.allSuggestions.filter(_.subsumedBy.isDefined)
+    if subsumed.nonEmpty then
+      info("")
+      info(s"=== Subsumed Patterns (${subsumed.size} patterns, included in optimal suggestions) ===")
+      subsumed.take(5).foreach { s =>
+        info(s"  - ${s.suggestedModelName}: ${s.group.occurrences} occ, ${s.group.nodeCount.toInt} nodes (inside pattern ${s.subsumedBy.map(h => (h.abs % 10000).toString).getOrElse("?")})")
+      }
+      if subsumed.size > 5 then
+        info(s"  ... and ${subsumed.size - 5} more")
+
+  /**
+    * Generate hierarchical report
+    */
+  def generateHierarchicalReport(
+      result: DuplicateDetectionResult,
+      config: RefactorConfig = RefactorConfig.default
+  ): String =
+    val hierarchy = evaluateHierarchically(result, config)
+
+    s"""
+       |Hierarchical Refactoring Analysis Report
+       |========================================
+       |
+       |${hierarchy.summary}
+       |
+       |Optimal Suggestions (model these):
+       |${hierarchy.optimalSuggestions.take(10).map(s => 
+         s"  ${s.rank}. ${s.suggestedModelName}: ${s.decision.summary}" +
+         (if s.subsumes.nonEmpty then s" [contains ${s.subsumes.size} nested]" else "")
+       ).mkString("\n")}
+       |
+       |Note: Optimal suggestions are root-level patterns that are not contained
+       |within other patterns. Modeling these will automatically cover the nested
+       |patterns, maximizing reduction without redundancy.
        |""".stripMargin
 
 end RefactoringDecider

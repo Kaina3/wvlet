@@ -94,6 +94,39 @@ object CollectorConfig:
 object SubtreeCollector extends LogSupport:
 
   /**
+    * Trie for checking whether a path has any ancestor path that is already registered.
+    *
+    * This supports fast "isDescendantOf" checks:
+    *   - Insert ancestor paths
+    *   - For a candidate path, if we encounter a terminal node while traversing,
+    *     then the candidate has an ancestor in the set.
+    */
+  private class PathTrie:
+    private class Node:
+      var terminal: Boolean = false
+      val children          = scala.collection.mutable.HashMap.empty[Int, Node]
+
+    private val root = new Node
+
+    def hasAncestor(path: List[Int]): Boolean =
+      var node = root
+      // We only care about strict descendants, so a terminal at any prefix implies overlap.
+      // (Equal path is not a descendant; we check terminal before consuming the next element.)
+      path.foreach { idx =>
+        if node.terminal then
+          return true
+        node = node.children.getOrElseUpdate(idx, new Node)
+      }
+      false
+
+    def add(path: List[Int]): Unit =
+      var node = root
+      path.foreach { idx =>
+        node = node.children.getOrElseUpdate(idx, new Node)
+      }
+      node.terminal = true
+
+  /**
     * Collect all subtrees from a single LogicalPlan
     *
     * @param plan
@@ -236,9 +269,28 @@ object SubtreeCollector extends LogSupport:
     * This helps avoid extracting patterns that are parts of larger patterns
     */
   def removeOverlapping(subtrees: List[CollectedSubtree]): List[CollectedSubtree] =
-    subtrees.filterNot { subtree =>
-      subtrees.exists(other => subtree != other && subtree.isDescendantOf(other))
-    }
+    // Overlap (ancestor/descendant) can only happen within the same source plan.
+    // In cross-query analysis, grouping by sourceId avoids quadratic blowups in huge hash groups.
+    val bySource = subtrees.groupBy(_.sourceId)
+    bySource.valuesIterator.flatMap(removeOverlappingWithinSource).toList
+
+  private def removeOverlappingWithinSource(subtrees: List[CollectedSubtree]): List[CollectedSubtree] =
+    if subtrees.size <= 1 then
+      subtrees
+    else
+      // Shorter paths are ancestors of longer ones. Process ancestors first.
+      val sorted = subtrees.sortBy(_.path.length)
+      val trie   = new PathTrie
+      val out    = ListBuffer.empty[CollectedSubtree]
+
+      sorted.foreach { s =>
+        if trie.hasAncestor(s.path) then
+          ()
+        else
+          out += s
+          trie.add(s.path)
+      }
+      out.toList
 
   /**
     * Print statistics about collected subtrees

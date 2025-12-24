@@ -54,16 +54,19 @@ object PatternExtractorConfig:
   * Result of pattern extraction
   *
   * @param suggestions
-  *   List of refactoring suggestions
+  *   List of refactoring suggestions (may include nested patterns)
   * @param detectionResult
   *   Raw duplicate detection result
   * @param report
   *   Human-readable report
+  * @param hierarchyResult
+  *   Optional hierarchical analysis result with optimal suggestions
   */
 case class PatternExtractionResult(
     suggestions: List[RefactoringSuggestion],
     detectionResult: DuplicateDetectionResult,
-    report: String
+    report: String,
+    hierarchyResult: Option[HierarchicalSuggestionResult] = None
 ):
   /**
     * Whether any actionable suggestions were found
@@ -76,9 +79,27 @@ case class PatternExtractionResult(
   def topSuggestion: Option[RefactoringSuggestion] = suggestions.headOption
 
   /**
-    * Total potential node reduction
+    * Total potential node reduction (from all suggestions, may overlap)
     */
   def totalPotentialReduction: Int = suggestions.map(_.decision.estimatedReduction).sum
+
+  /**
+    * Optimal suggestions for modeling (no overlapping/nested patterns)
+    */
+  def optimalSuggestions: List[RefactoringSuggestion] =
+    hierarchyResult.map(_.optimalSuggestions).getOrElse(suggestions)
+
+  /**
+    * Total reduction from optimal suggestions (no double-counting)
+    */
+  def optimalReduction: Int =
+    hierarchyResult.map(_.totalReductionOptimal).getOrElse(totalPotentialReduction)
+
+  /**
+    * Number of suggestions that are subsumed by others (nested patterns)
+    */
+  def subsumedCount: Int =
+    hierarchyResult.map(_.allSuggestions.count(_.subsumedBy.isDefined)).getOrElse(0)
 
 end PatternExtractionResult
 
@@ -172,16 +193,19 @@ object PatternExtractor extends Phase("pattern-extractor") with LogSupport:
 
     debug(detectionResult.summary)
 
-    // Evaluate and rank suggestions
-    val suggestions = RefactoringDecider.evaluateAll(
+    // Run hierarchical analysis to find optimal suggestions
+    val hierarchyResult = RefactoringDecider.evaluateHierarchically(
       detectionResult,
       config.refactorConfig
-    ).take(config.maxSuggestions)
+    )
+
+    // Use optimal suggestions (filtered for nested patterns)
+    val suggestions = hierarchyResult.optimalSuggestions.take(config.maxSuggestions)
 
     // Generate report
-    val report = RefactoringDecider.generateReport(detectionResult, config.refactorConfig)
+    val report = RefactoringDecider.generateHierarchicalReport(detectionResult, config.refactorConfig)
 
-    PatternExtractionResult(suggestions, detectionResult, report)
+    PatternExtractionResult(suggestions, detectionResult, report, Some(hierarchyResult))
 
   /**
     * Analyze multiple LogicalPlans for cross-query patterns
@@ -200,24 +224,33 @@ object PatternExtractor extends Phase("pattern-extractor") with LogSupport:
     debug(s"Analyzing ${plans.size} plans for cross-query patterns...")
 
     // Detect duplicates across all plans
+    val t0 = System.currentTimeMillis()
     val detectionResult = DuplicateDetector.detectAcross(
       plans,
       config.detectorConfig,
       config.collectorConfig
     )
+    val t1 = System.currentTimeMillis()
+    println(s"  [PatternExtractor] Duplicate detection: ${t1 - t0}ms")
 
     debug(detectionResult.summary)
 
-    // Evaluate and rank suggestions
-    val suggestions = RefactoringDecider.evaluateAll(
+    // Run hierarchical analysis to find optimal suggestions
+    val t2 = System.currentTimeMillis()
+    val hierarchyResult = RefactoringDecider.evaluateHierarchically(
       detectionResult,
       config.refactorConfig
-    ).take(config.maxSuggestions)
+    )
+    val t3 = System.currentTimeMillis()
+    println(s"  [PatternExtractor] Hierarchical evaluation: ${t3 - t2}ms")
+
+    // Use optimal suggestions (filtered for nested patterns)
+    val suggestions = hierarchyResult.optimalSuggestions.take(config.maxSuggestions)
 
     // Generate report
-    val report = RefactoringDecider.generateReport(detectionResult, config.refactorConfig)
+    val report = RefactoringDecider.generateHierarchicalReport(detectionResult, config.refactorConfig)
 
-    PatternExtractionResult(suggestions, detectionResult, report)
+    PatternExtractionResult(suggestions, detectionResult, report, Some(hierarchyResult))
 
   /**
     * Quick analysis with default settings

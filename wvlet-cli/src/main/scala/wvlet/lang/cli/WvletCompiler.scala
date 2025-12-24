@@ -59,8 +59,17 @@ case class PatternAnalysisOption(
     top: Int = 10,
     @option(prefix = "--json", description = "Output results as JSON")
     json: Boolean = false,
+    @option(prefix = "-o,--output", description = "Output file path (stdout if not specified)")
+    output: Option[String] = None,
+    @option(
+      prefix = "--parse-only",
+      description = "Parse-only mode (skip typing/analysis phases) for faster bulk processing"
+    )
+    parseOnly: Boolean = false,
     @option(prefix = "--dir", description = "Directory of .wv files to analyze (enables cross-query analysis)")
     dir: Option[String] = None,
+    @option(prefix = "--offset", description = "Skip first N files in directory (for batch processing)")
+    offset: Int = 0,
     @option(prefix = "--limit", description = "Limit number of files to analyze from directory")
     limit: Option[Int] = None,
     @option(prefix = "--pattern", description = "File pattern to match (default: *.wv)")
@@ -225,15 +234,17 @@ class WvletCompiler(
       extractorConfig: PatternExtractorConfig
   ): Unit =
     val inputUnit   = getInputUnit(forSQL = false)
-    val ctx         = compileInternal(inputUnit)
+    val ctx         = compileInternal(inputUnit, parseOnly = patternOption.parseOnly)
     val logicalPlan = inputUnit.resolvedPlan
 
     val result = PatternExtractor.analyze(logicalPlan, extractorConfig)
 
-    if patternOption.json then
-      printJsonResult(result, 1)
+    val output = if patternOption.json then
+      formatJsonResult(result, 1)
     else
-      printTextResult(result, patternOption.top, 1)
+      formatTextResult(result, patternOption.top, 1)
+
+    writeOutput(output, patternOption.output)
 
   /**
     * Analyze patterns from multiple files in a directory
@@ -253,9 +264,12 @@ class WvletCompiler(
     // Find matching files
     val matcher   = FileSystems.getDefault.getPathMatcher(s"glob:${patternOption.pattern}")
     val allFiles  = dir.listFiles().filter(f => f.isFile && matcher.matches(Paths.get(f.getName))).toList.sortBy(_.getName)
+    val filesAfterOffset =
+      if patternOption.offset <= 0 then allFiles
+      else allFiles.drop(patternOption.offset)
     val filesToProcess = patternOption.limit match
-      case Some(n) => allFiles.take(n)
-      case None    => allFiles
+      case Some(n) => filesAfterOffset.take(n)
+      case None    => filesAfterOffset
 
     if filesToProcess.isEmpty then
       println(s"No files matching '${patternOption.pattern}' found in $dirPath")
@@ -265,7 +279,9 @@ class WvletCompiler(
     println()
 
     // Compile all files and collect plans
-    val compiler          = createCompiler()
+    // NOTE: Even Compiler.parseOnly still parses *all* units in sourceFolders.
+    // For bulk directory checks, we want a fast path that parses only the target file.
+    val compiler          = if patternOption.parseOnly then null else createCompiler(parseOnly = false)
     var successCount      = 0
     var failCount         = 0
     var totalOriginalNodes = 0
@@ -279,8 +295,16 @@ class WvletCompiler(
         System.out.flush()
       try
         val unit = CompilationUnit.fromFile(file.getAbsolutePath)
-        compiler.compileSingleUnit(unit)
-        val plan = unit.resolvedPlan
+        val plan =
+          if patternOption.parseOnly then
+            // Parse-only fast path: parse only this file (no full compiler context)
+            val p = wvlet.lang.compiler.parser.ParserPhase.parseOnly(unit)
+            unit.unresolvedPlan = p
+            unit.resolvedPlan = p
+            p
+          else
+            compiler.compileSingleUnit(unit)
+            unit.resolvedPlan
         if plan != null then
           plans += ((file.getName, plan))
           totalOriginalNodes += countNodes(plan)
@@ -322,10 +346,12 @@ class WvletCompiler(
     println(s"Analysis completed in ${analysisTime}ms")
     println()
 
-    if patternOption.json then
-      printJsonResult(result, plans.size, Some(totalOriginalNodes))
+    val output = if patternOption.json then
+      formatJsonResult(result, plans.size, Some(totalOriginalNodes))
     else
-      printTextResult(result, patternOption.top, plans.size, Some(totalOriginalNodes))
+      formatTextResult(result, patternOption.top, plans.size, Some(totalOriginalNodes))
+
+    writeOutput(output, patternOption.output)
 
   /**
     * Count nodes in a LogicalPlan tree
@@ -377,74 +403,106 @@ class WvletCompiler(
       crossQueryAnalysis = patternOption.dir.isDefined
     )
 
-  private def printTextResult(
+  private def formatTextResult(
       result: PatternExtractionResult,
       topN: Int,
       fileCount: Int,
       totalOriginalNodes: Option[Int] = None
-  ): Unit =
-    println("=" * 60)
-    println("Pattern Analysis Report")
-    println("=" * 60)
-    println()
+  ): String =
+    val sb = new StringBuilder()
+    sb.append("=" * 60).append("\n")
+    sb.append("Pattern Analysis Report\n")
+    sb.append("=" * 60).append("\n")
+    sb.append("\n")
 
-    println(s"Summary:")
-    println(s"  - Files analyzed: $fileCount")
+    sb.append(s"Summary:\n")
+    sb.append(s"  - Files analyzed: $fileCount\n")
     totalOriginalNodes.foreach { total =>
-      println(s"  - Total original nodes: $total")
+      sb.append(s"  - Total original nodes: $total\n")
     }
-    println(s"  - Subtrees analyzed: ${result.detectionResult.totalSubtrees}")
-    println(s"  - Unique patterns: ${result.detectionResult.uniqueHashes}")
-    println(s"  - Duplicate groups: ${result.detectionResult.groups.size}")
-    println(s"  - Actionable suggestions: ${result.suggestions.size}")
-    println(s"  - Total potential reduction: ${result.totalPotentialReduction} nodes")
-    totalOriginalNodes.foreach { total =>
-      if total > 0 then
-        val reductionPct = (result.totalPotentialReduction.toDouble / total) * 100
-        println(f"  - Overall reduction rate: $reductionPct%.2f%%")
-    }
-    println()
+    sb.append(s"  - Subtrees analyzed: ${result.detectionResult.totalSubtrees}\n")
+    sb.append(s"  - Unique patterns: ${result.detectionResult.uniqueHashes}\n")
+    sb.append(s"  - Duplicate groups: ${result.detectionResult.groups.size}\n")
+
+    // Show hierarchy information if available
+    result.hierarchyResult match
+      case Some(hierarchy) =>
+        sb.append(s"  - All actionable suggestions: ${hierarchy.allSuggestions.size}\n")
+        sb.append(s"  - Optimal suggestions (for modeling): ${hierarchy.optimalSuggestions.size}\n")
+        sb.append(s"  - Subsumed (nested) patterns: ${result.subsumedCount}\n")
+        sb.append(s"  - Optimal reduction: ${result.optimalReduction} nodes\n")
+        totalOriginalNodes.foreach { total =>
+          if total > 0 then
+            val reductionPct = (result.optimalReduction.toDouble / total) * 100
+            sb.append(f"  - Optimal reduction rate: $reductionPct%.2f%%\n")
+        }
+      case None =>
+        sb.append(s"  - Actionable suggestions: ${result.suggestions.size}\n")
+        sb.append(s"  - Total potential reduction: ${result.totalPotentialReduction} nodes\n")
+        totalOriginalNodes.foreach { total =>
+          if total > 0 then
+            val reductionPct = (result.totalPotentialReduction.toDouble / total) * 100
+            sb.append(f"  - Overall reduction rate: $reductionPct%.2f%%\n")
+        }
+    sb.append("\n")
 
     if result.suggestions.isEmpty then
-      println("No refactoring suggestions found.")
-      println("Try using --aggressive flag for more patterns, or check if the query has repeated structures.")
+      sb.append("No refactoring suggestions found.\n")
+      sb.append("Try using --aggressive flag for more patterns, or check if the query has repeated structures.\n")
     else
-      println(s"Top ${math.min(topN, result.suggestions.size)} Refactoring Suggestions:")
-      println("-" * 60)
+      val optimalSuggestions = result.optimalSuggestions
+      sb.append(s"Top ${math.min(topN, optimalSuggestions.size)} Optimal Refactoring Suggestions:\n")
+      sb.append("-" * 60).append("\n")
 
-      result.suggestions.take(topN).foreach { suggestion =>
-        println()
-        println(s"#${suggestion.rank} ${suggestion.suggestedModelName}")
-        println(s"  Decision: ${suggestion.decision.summary}")
-        println(s"  Occurrences: ${suggestion.group.occurrences}")
-        println(s"  Parameters needed: ${suggestion.parameterCount}")
+      optimalSuggestions.take(topN).foreach { suggestion =>
+        sb.append("\n")
+        sb.append(s"#${suggestion.rank} ${suggestion.suggestedModelName}\n")
+        sb.append(s"  Decision: ${suggestion.decision.summary}\n")
+        sb.append(s"  Occurrences: ${suggestion.group.occurrences}\n")
+        sb.append(s"  Parameters needed: ${suggestion.parameterCount}\n")
 
         if suggestion.group.isCrossQuery then
-          println(s"  Type: Cross-query pattern")
-          println(s"  Sources: ${suggestion.group.sources.mkString(", ")}")
+          sb.append(s"  Type: Cross-query pattern\n")
+          sb.append(s"  Sources: ${suggestion.group.sources.mkString(", ")}\n")
         else
-          println(s"  Type: Single-query pattern")
+          sb.append(s"  Type: Single-query pattern\n")
+          if suggestion.group.sources.nonEmpty then
+            sb.append(s"  Source: ${suggestion.group.sources.head}\n")
+
+        // Show hierarchy info
+        if suggestion.subsumes.nonEmpty then
+          sb.append(s"  Contains: ${suggestion.subsumes.size} nested pattern(s)\n")
 
         suggestion.unifyResult.foreach { unify =>
           if unify.variableParameters.nonEmpty then
-            println(s"  Extracted parameters:")
+            sb.append(s"  Extracted parameters:\n")
             unify.variableParameters.foreach { param =>
-              println(s"    - ${param.id}: ${param.inferredType} (${param.distinctValueCount} distinct values)")
+              sb.append(s"    - ${param.id}: ${param.inferredType} (${param.distinctValueCount} distinct values)\n")
             }
         }
 
         if suggestion.decision.warnings.nonEmpty then
-          println(s"  Warnings: ${suggestion.decision.warnings.mkString(", ")}")
+          sb.append(s"  Warnings: ${suggestion.decision.warnings.mkString(", ")}\n")
       }
 
-    println()
-    println("=" * 60)
+      // Show subsumed patterns summary
+      result.hierarchyResult.foreach { hierarchy =>
+        val subsumed = hierarchy.allSuggestions.filter(_.subsumedBy.isDefined)
+        if subsumed.nonEmpty then
+          sb.append("\n")
+          sb.append(s"Note: ${subsumed.size} nested patterns were detected but are contained within\n")
+          sb.append(s"      the optimal suggestions above. No separate modeling needed.\n")
+      }
 
-  private def printJsonResult(
+    sb.append("\n")
+    sb.append("=" * 60).append("\n")
+    sb.toString()
+
+  private def formatJsonResult(
       result: PatternExtractionResult,
       fileCount: Int,
       totalOriginalNodes: Option[Int] = None
-  ): Unit =
+  ): String =
     import scala.collection.mutable.StringBuilder
     val json = new StringBuilder
     json.append("{\n")
@@ -455,16 +513,32 @@ class WvletCompiler(
     json.append(s"""  "totalSubtrees": ${result.detectionResult.totalSubtrees},\n""")
     json.append(s"""  "uniquePatterns": ${result.detectionResult.uniqueHashes},\n""")
     json.append(s"""  "duplicateGroups": ${result.detectionResult.groups.size},\n""")
-    json.append(s"""  "actionableSuggestions": ${result.suggestions.size},\n""")
-    json.append(s"""  "totalPotentialReduction": ${result.totalPotentialReduction},\n""")
-    totalOriginalNodes.foreach { total =>
-      if total > 0 then
-        val reductionPct = (result.totalPotentialReduction.toDouble / total) * 100
-        json.append(f"""  "overallReductionRate": $reductionPct%.4f,\n""")
-    }
+
+    // Hierarchy info
+    result.hierarchyResult match
+      case Some(hierarchy) =>
+        json.append(s"""  "allActionableSuggestions": ${hierarchy.allSuggestions.size},\n""")
+        json.append(s"""  "optimalSuggestions": ${hierarchy.optimalSuggestions.size},\n""")
+        json.append(s"""  "subsumedPatterns": ${result.subsumedCount},\n""")
+        json.append(s"""  "optimalReduction": ${result.optimalReduction},\n""")
+        totalOriginalNodes.foreach { total =>
+          if total > 0 then
+            val reductionPct = (result.optimalReduction.toDouble / total) * 100
+            json.append(f"""  "optimalReductionRate": $reductionPct%.4f,\n""")
+        }
+      case None =>
+        json.append(s"""  "actionableSuggestions": ${result.suggestions.size},\n""")
+        json.append(s"""  "totalPotentialReduction": ${result.totalPotentialReduction},\n""")
+        totalOriginalNodes.foreach { total =>
+          if total > 0 then
+            val reductionPct = (result.totalPotentialReduction.toDouble / total) * 100
+            json.append(f"""  "overallReductionRate": $reductionPct%.4f,\n""")
+        }
+
     json.append("""  "suggestions": [""")
 
-    result.suggestions.zipWithIndex.foreach { case (s, idx) =>
+    val optimalSuggestions = result.optimalSuggestions
+    optimalSuggestions.zipWithIndex.foreach { case (s, idx) =>
       if idx > 0 then json.append(",")
       json.append("\n    {\n")
       json.append(s"""      "rank": ${s.rank},\n""")
@@ -474,12 +548,36 @@ class WvletCompiler(
       json.append(s"""      "parameters": ${s.parameterCount},\n""")
       json.append(s"""      "estimatedReduction": ${s.decision.estimatedReduction},\n""")
       json.append(s"""      "isCrossQuery": ${s.group.isCrossQuery},\n""")
+      if s.group.isCrossQuery then
+        json.append(s"""      "sources": [${s.group.sources.map(src => s""""$src"""").mkString(", ")}],\n""")
+      else if s.group.sources.nonEmpty then
+        json.append(s"""      "source": "${s.group.sources.head}",\n""")
+      json.append(s"""      "isOptimal": ${s.isOptimal},\n""")
+      json.append(s"""      "containsNested": ${s.subsumes.size},\n""")
       json.append(s"""      "reason": "${s.decision.reason.replace("\"", "\\\"")}"\n""")
       json.append("    }")
     }
 
     json.append("\n  ]\n")
     json.append("}\n")
-    println(json.toString())
+    json.toString()
+
+  /**
+    * Write output to file or stdout
+    */
+  private def writeOutput(content: String, outputPath: Option[String]): Unit =
+    outputPath match
+      case Some(path) =>
+        import java.nio.file.{Files, Paths}
+        import java.nio.charset.StandardCharsets
+        val outputPath = Paths.get(path)
+        // Create parent directories if they don't exist
+        val parentDir = outputPath.getParent
+        if parentDir != null && !Files.exists(parentDir) then
+          Files.createDirectories(parentDir)
+        Files.write(outputPath, content.getBytes(StandardCharsets.UTF_8))
+        println(s"Results written to: $path")
+      case None =>
+        println(content)
 
 end WvletCompiler
