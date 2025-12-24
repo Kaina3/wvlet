@@ -221,6 +221,18 @@ object RefactoringApplier extends LogSupport:
     * @return A ModelDef node
     */
   private def generateModelDef(modelName: String, unifyResult: AntiUnifyResult): ModelDef =
+    def stripNonSemanticWrappersForModel(r: Relation): Relation =
+      r match
+        // The alias is an occurrence-local detail (e.g., join ... as t9) and should not be baked into a model body.
+        // Keeping it causes extra nesting like `from { ... } as t9` inside model definitions.
+        case a: AliasedRelation =>
+          stripNonSemanticWrappersForModel(a.child)
+        // Query wrapper doesn't add semantics for a model body, but can affect pretty-printing/brace insertion.
+        case q: Query =>
+          stripNonSemanticWrappersForModel(q.child)
+        case other =>
+          other
+
     // Extract variable parameters (those that differ across instances)
     val varParams = unifyResult.variableParameters
     
@@ -234,16 +246,16 @@ object RefactoringApplier extends LogSupport:
       )
     }
     
-    // Wrap the pattern in a Query if it's a Relation
+    // Wrap the pattern in a Query. Also strip wrappers that should not be part of a reusable model body.
     val queryBody = unifyResult.pattern match
       case r: Relation =>
-        Query(r, NoSpan)
+        Query(stripNonSemanticWrappersForModel(r), NoSpan)
       case q: Query =>
-        q
+        Query(stripNonSemanticWrappersForModel(q.child), NoSpan)
       case other =>
-        // Fallback: wrap in Query with EmptyRelation + select
+        // Fallback: wrap in Query with EmptyRelation
         // This shouldn't happen if SubtreeCollector only collects Relations
-        warn(s"Pattern is not a Relation: ${other.getClass.getSimpleName}, wrapping as-is")
+        warn(s"Pattern is not a Relation: ${other.getClass.getSimpleName}, using EmptyRelation")
         Query(EmptyRelation(NoSpan), NoSpan)
     
     ModelDef(
