@@ -96,6 +96,38 @@ case class ApplyResult(
 end ApplyResult
 
 /**
+  * Result of applying refactorings across multiple files
+  *
+  * @param models List of generated ModelDefs (shared across files)
+  * @param fileResults List of (fileName, transformedPlan, summary) tuples
+  * @param applied All successfully applied refactorings
+  * @param skipped All skipped refactorings
+  */
+case class MultiApplyResult(
+    models: List[ModelDef],
+    fileResults: List[(String, LogicalPlan)],
+    applied: List[AppliedRefactoring],
+    skipped: List[SkippedRefactoring]
+):
+  def hasChanges: Boolean = applied.nonEmpty
+  
+  def totalOccurrencesReplaced: Int = applied.map(_.occurrencesReplaced).sum
+  
+  def totalNodeReduction: Int = applied.map(_.nodeReduction).sum
+  
+  def summary: String =
+    s"""Multi-file Apply Result:
+       |  Models generated: ${models.size}
+       |  Files transformed: ${fileResults.size}
+       |  Applied: ${applied.size} refactoring(s)
+       |  Skipped: ${skipped.size}
+       |  Total occurrences replaced: $totalOccurrencesReplaced
+       |  Total node reduction: $totalNodeReduction
+       |""".stripMargin
+
+end MultiApplyResult
+
+/**
   * Applies refactoring suggestions to transform a LogicalPlan.
   *
   * This is the main orchestrator that:
@@ -221,6 +253,9 @@ object RefactoringApplier extends LogSupport:
     * @return A ModelDef node
     */
   private def generateModelDef(modelName: String, unifyResult: AntiUnifyResult): ModelDef =
+    // Recursively strip wrappers that don't add semantics to a reusable model body.
+    // Keep stripping until we hit a non-wrapper node or an actual relation operation.
+    @scala.annotation.tailrec
     def stripNonSemanticWrappersForModel(r: Relation): Relation =
       r match
         // The alias is an occurrence-local detail (e.g., join ... as t9) and should not be baked into a model body.
@@ -248,10 +283,10 @@ object RefactoringApplier extends LogSupport:
     
     // Wrap the pattern in a Query. Also strip wrappers that should not be part of a reusable model body.
     val queryBody = unifyResult.pattern match
-      case r: Relation =>
-        Query(stripNonSemanticWrappersForModel(r), NoSpan)
       case q: Query =>
         Query(stripNonSemanticWrappersForModel(q.child), NoSpan)
+      case r: Relation =>
+        Query(stripNonSemanticWrappersForModel(r), NoSpan)
       case other =>
         // Fallback: wrap in Query with EmptyRelation
         // This shouldn't happen if SubtreeCollector only collects Relations
@@ -338,5 +373,129 @@ object RefactoringApplier extends LogSupport:
           statements = models :+ other,
           span = NoSpan
         )
+
+  /**
+    * Apply refactorings to multiple files based on cross-query pattern extraction.
+    *
+    * This method:
+    * 1. Generates shared ModelDefs for patterns found across files
+    * 2. Transforms each file's plan by replacing occurrences with ModelScan
+    * 3. Returns models separately (for a shared model file) and transformed plans (one per input file)
+    *
+    * @param namedPlans List of (fileName, LogicalPlan) tuples
+    * @param extraction The cross-query pattern extraction result
+    * @param config Configuration for how to apply refactorings
+    * @return MultiApplyResult containing shared models and per-file transformed plans
+    */
+  def applyRefactoringsMultiple(
+      namedPlans: List[(String, LogicalPlan)],
+      extraction: PatternExtractionResult,
+      config: ApplyConfig = ApplyConfig.default
+  ): MultiApplyResult =
+    if !extraction.hasSuggestions then
+      return MultiApplyResult(Nil, namedPlans, Nil, Nil)
+
+    // Get suggestions to apply
+    val suggestions = if config.useOptimalSuggestions then
+      extraction.optimalSuggestions
+    else
+      extraction.suggestions
+
+    // Filter and take top K
+    val candidateSuggestions = suggestions
+      .filter(s => s.decision.shouldRefactor)
+      .filter(s => !config.requireVariableParams || s.unifyResult.exists(_.variableParameters.nonEmpty))
+      .take(config.topK)
+
+    if candidateSuggestions.isEmpty then
+      return MultiApplyResult(
+        Nil,
+        namedPlans,
+        Nil,
+        List(SkippedRefactoring("all", "No applicable suggestions found"))
+      )
+
+    // Generate models and collect occurrence info
+    val generatedModels = scala.collection.mutable.ListBuffer[ModelDef]()
+    val applied = scala.collection.mutable.ListBuffer[AppliedRefactoring]()
+    val skipped = scala.collection.mutable.ListBuffer[SkippedRefactoring]()
+    
+    // Map: modelName -> (varParams, unifyResult, occurrences grouped by sourceId/fileName)
+    case class ModelInfo(
+        modelName: String,
+        varParams: List[ExtractedParameter],
+        unifyResult: AntiUnifyResult,
+        occurrencesBySource: Map[Option[String], List[(CollectedSubtree, Substitution)]]
+    )
+    
+    val modelInfos = scala.collection.mutable.ListBuffer[ModelInfo]()
+
+    candidateSuggestions.foreach { suggestion =>
+      val suggestionId = suggestion.suggestedModelName
+      
+      suggestion.unifyResult match
+        case None =>
+          skipped += SkippedRefactoring(suggestionId, "No anti-unification result")
+          
+        case Some(unifyResult) =>
+          val varParams = unifyResult.variableParameters
+          if config.requireVariableParams && varParams.isEmpty then
+            skipped += SkippedRefactoring(suggestionId, "No variable parameters")
+          else
+            val modelName = s"${config.modelNamePrefix}_${suggestionId}"
+            
+            // Generate ModelDef
+            val modelDef = generateModelDef(modelName, unifyResult)
+            generatedModels += modelDef
+            
+            // Group occurrences by sourceId (file name)
+            val occurrences = suggestion.group.subtrees
+            val occurrencesBySource = occurrences.zipWithIndex.groupBy { case (subtree, idx) =>
+              subtree.sourceId
+            }.map { case (sourceId, items) =>
+              val subtreesWithSubs = items.map { case (subtree, occIdx) =>
+                val substitution = unifyResult.substitutions.lift(occIdx).getOrElse(
+                  unifyResult.substitutions.headOption.getOrElse(Substitution(0, Map.empty))
+                )
+                (subtree, substitution)
+              }
+              sourceId -> subtreesWithSubs
+            }
+            
+            modelInfos += ModelInfo(modelName, varParams, unifyResult, occurrencesBySource)
+            
+            applied += AppliedRefactoring(
+              suggestionId = modelName,
+              modelDef = modelDef,
+              occurrencesReplaced = occurrences.size,
+              nodeReduction = suggestion.decision.estimatedReduction
+            )
+    }
+
+    // Apply replacements to each file's plan
+    val transformedPlans = namedPlans.map { case (fileName, plan) =>
+      // Collect all replacements for this file (match by sourceId = fileName)
+      val replacements = modelInfos.flatMap { info =>
+        info.occurrencesBySource.getOrElse(Some(fileName), Nil).map { case (subtree, substitution) =>
+          val modelScan = generateModelScan(info.modelName, info.varParams, substitution, subtree)
+          (subtree.path, modelScan)
+        }
+      }.toList
+      
+      // Apply replacements if any
+      val transformedPlan = if replacements.nonEmpty then
+        PathRewriter.replaceMany(plan, replacements)
+      else
+        plan
+      
+      (fileName, transformedPlan)
+    }
+
+    MultiApplyResult(
+      models = generatedModels.toList,
+      fileResults = transformedPlans,
+      applied = applied.toList,
+      skipped = skipped.toList
+    )
 
 end RefactoringApplier

@@ -20,6 +20,8 @@ import wvlet.lang.compiler.Symbol
 import wvlet.lang.compiler.WorkEnv
 import wvlet.lang.compiler.analyzer.refactor.*
 import wvlet.lang.model.plan.LogicalPlan
+import wvlet.lang.model.plan.PackageDef
+import wvlet.lang.model.expr.NameExpr
 import wvlet.lang.runner.QueryExecutor
 import wvlet.lang.runner.connector.DBConnector
 import wvlet.lang.runner.connector.DBConnectorProvider
@@ -83,7 +85,13 @@ case class PatternAnalysisOption(
     @option(prefix = "--apply-top", description = "Number of top suggestions to apply (default: 1)")
     applyTop: Int = 1,
     @option(prefix = "--model-prefix", description = "Prefix for generated model names (default: auto)")
-    modelPrefix: String = "auto"
+    modelPrefix: String = "auto",
+    @option(prefix = "--output-dir", description = "Output directory for refactored files (multi-file mode)")
+    outputDir: Option[String] = None,
+    @option(prefix = "--model-file", description = "File name for extracted model definitions (default: _models.wv)")
+    modelFile: String = "_models.wv",
+    @option(prefix = "--suffix", description = "Suffix for refactored file names (default: _refactored)")
+    suffix: String = "_refactored"
 )
 
 class WvletCompiler(
@@ -322,7 +330,7 @@ class WvletCompiler(
       useOptimalSuggestions = true,
       modelNamePrefix = patternOption.modelPrefix,
       skipIfOverlaps = true,
-      requireVariableParams = true
+      requireVariableParams = false  // Allow patterns without variable params
     )
 
     // Apply refactorings
@@ -362,6 +370,105 @@ class WvletCompiler(
 
     val fullOutput = header.toString + output
     writeOutput(fullOutput, patternOption.output)
+
+  /**
+    * Apply refactorings to multiple files and output to separate files.
+    *
+    * - Each input file is written as {basename}{suffix}.wv to outputDir
+    * - Shared model definitions are written to {modelFile} in outputDir
+    */
+  private def applyAndOutputMultipleRefactorings(
+      inputDir: String,
+      namedPlans: List[(String, LogicalPlan)],
+      extraction: PatternExtractionResult,
+      patternOption: PatternAnalysisOption
+  ): Unit =
+    import java.io.{File, PrintWriter}
+    import java.nio.file.{Files, Paths}
+    import wvlet.lang.compiler.codegen.{WvletGenerator, CodeFormatterConfig}
+    import wvlet.lang.compiler.Context
+
+    // Configure the applier
+    val applyConfig = ApplyConfig(
+      topK = patternOption.applyTop,
+      useOptimalSuggestions = true,
+      modelNamePrefix = patternOption.modelPrefix,
+      skipIfOverlaps = true,
+      requireVariableParams = false  // Allow patterns without variable params
+    )
+
+    // Apply refactorings across all files
+    val multiResult = RefactoringApplier.applyRefactoringsMultiple(namedPlans, extraction, applyConfig)
+
+    if !multiResult.hasChanges then
+      println("// No refactorings applied (no applicable suggestions found)")
+      return
+
+    // Determine output directory
+    val outputDir = patternOption.outputDir.getOrElse(inputDir)
+    val outputPath = Paths.get(outputDir)
+    if !Files.exists(outputPath) then
+      Files.createDirectories(outputPath)
+
+    // Create a minimal context for code generation
+    given Context = Context.NoContext
+
+    val config    = CodeFormatterConfig()
+    val generator = WvletGenerator(config)
+
+    // Write model file
+    if multiResult.models.nonEmpty then
+      val modelFilePath = outputPath.resolve(patternOption.modelFile)
+      val modelHeader = new StringBuilder
+      modelHeader.append(s"// Auto-generated model definitions by Wvlet Pattern Analyzer\n")
+      modelHeader.append(s"// Generated: ${java.time.LocalDateTime.now()}\n")
+      modelHeader.append(s"// Models: ${multiResult.models.size}\n")
+      modelHeader.append(s"// Total occurrences replaced: ${multiResult.totalOccurrencesReplaced}\n")
+      modelHeader.append("\n")
+
+      val modelPackage = PackageDef(
+        name = NameExpr.EmptyName,
+        statements = multiResult.models,
+        span = wvlet.lang.api.Span.NoSpan
+      )
+      val modelCode = generator.print(modelPackage)
+      
+      val pw = new PrintWriter(modelFilePath.toFile)
+      try
+        pw.print(modelHeader.toString + modelCode)
+      finally
+        pw.close()
+      
+      println(s"Wrote model definitions to: ${modelFilePath}")
+
+    // Write each transformed file
+    var filesWritten = 0
+    multiResult.fileResults.foreach { case (originalName, plan) =>
+      val baseName = originalName.stripSuffix(".wv")
+      val outputFileName = s"${baseName}${patternOption.suffix}.wv"
+      val outputFilePath = outputPath.resolve(outputFileName)
+      
+      // Add import comment for model file
+      val fileHeader = new StringBuilder
+      fileHeader.append(s"// Auto-refactored by Wvlet Pattern Analyzer\n")
+      fileHeader.append(s"// Original file: ${originalName}\n")
+      if multiResult.models.nonEmpty then
+        fileHeader.append(s"// Models defined in: ${patternOption.modelFile}\n")
+      fileHeader.append("\n")
+      
+      val code = generator.print(plan)
+      
+      val pw = new PrintWriter(outputFilePath.toFile)
+      try
+        pw.print(fileHeader.toString + code)
+        filesWritten += 1
+      finally
+        pw.close()
+    }
+
+    println(s"Wrote ${filesWritten} refactored files to: ${outputDir}")
+    println()
+    println(multiResult.summary)
 
   /**
     * Analyze patterns from multiple files in a directory
@@ -463,12 +570,16 @@ class WvletCompiler(
     println(s"Analysis completed in ${analysisTime}ms")
     println()
 
-    val output = if patternOption.json then
-      formatJsonResult(result, plans.size, Some(totalOriginalNodes))
+    // Check if we should apply refactorings
+    if patternOption.apply then
+      applyAndOutputMultipleRefactorings(dirPath, plans.toList, result, patternOption)
     else
-      formatTextResult(result, patternOption.top, plans.size, Some(totalOriginalNodes))
+      val output = if patternOption.json then
+        formatJsonResult(result, plans.size, Some(totalOriginalNodes))
+      else
+        formatTextResult(result, patternOption.top, plans.size, Some(totalOriginalNodes))
 
-    writeOutput(output, patternOption.output)
+      writeOutput(output, patternOption.output)
 
   /**
     * Count nodes in a LogicalPlan tree
