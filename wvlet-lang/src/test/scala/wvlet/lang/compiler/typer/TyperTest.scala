@@ -18,7 +18,9 @@ import wvlet.lang.model.Type.NoType
 import wvlet.lang.model.Type.ErrorType
 import wvlet.lang.model.DataType
 import wvlet.lang.model.DataType.BooleanType
+import wvlet.lang.model.DataType.IntType
 import wvlet.lang.model.DataType.LongType
+import wvlet.lang.model.DataType.FloatType
 import wvlet.lang.model.DataType.DoubleType
 import wvlet.lang.model.DataType.StringType
 import wvlet.lang.model.DataType.NullType
@@ -26,7 +28,7 @@ import wvlet.lang.model.DataType.SchemaType
 import wvlet.lang.model.DataType.NamedType
 import wvlet.lang.model.expr.*
 import wvlet.lang.model.expr.UnquotedIdentifier
-import wvlet.lang.model.plan.LogicalPlan
+import wvlet.lang.model.plan.*
 import wvlet.lang.compiler.CompilationUnit
 import wvlet.lang.compiler.Compiler
 import wvlet.lang.compiler.CompilerOptions
@@ -40,12 +42,14 @@ import wvlet.airspec.AirSpec
 
 class TyperTest extends AirSpec:
 
-  private def testContext: TyperContext = TyperContext(
-    owner = Symbol.NoSymbol,
-    scope = Scope.newScope(0),
-    compilationUnit = CompilationUnit.empty,
-    context = null
-  )
+  private def testContext: Context =
+    val global = Context.testGlobalContext(".")
+    Context(
+      global = global,
+      owner = Symbol.NoSymbol,
+      scope = Scope.newScope(0),
+      compilationUnit = CompilationUnit.empty
+    )
 
   test("tpe field should be accessible on all SyntaxTreeNode instances"):
     val lit = LongLiteral(42, "42", Span.NoSpan)
@@ -61,7 +65,7 @@ class TyperTest extends AirSpec:
     lit.isTyped.shouldBe(true)
 
   test("TyperRules should type literals correctly"):
-    given ctx: TyperContext = testContext
+    given ctx: Context = testContext
 
     val longLit   = LongLiteral(42, "42", Span.NoSpan)
     val doubleLit = DoubleLiteral(3.14, "3.14", Span.NoSpan)
@@ -83,7 +87,7 @@ class TyperTest extends AirSpec:
     typedNull.tpe shouldBe NullType
 
   test("TyperRules should type arithmetic operations"):
-    given ctx: TyperContext = testContext
+    given ctx: Context = testContext
 
     val left = LongLiteral(10, "10", Span.NoSpan)
     left.tpe = LongType
@@ -96,7 +100,7 @@ class TyperTest extends AirSpec:
     typed.tpe shouldBe LongType
 
   test("TyperRules should type comparison operations"):
-    given ctx: TyperContext = testContext
+    given ctx: Context = testContext
 
     val left = LongLiteral(10, "10", Span.NoSpan)
     left.tpe = LongType
@@ -109,7 +113,7 @@ class TyperTest extends AirSpec:
     typed.tpe shouldBe BooleanType
 
   test("TyperRules should type logical operations"):
-    given ctx: TyperContext = testContext
+    given ctx: Context = testContext
 
     val left = TrueLiteral(Span.NoSpan)
     left.tpe = BooleanType
@@ -122,7 +126,7 @@ class TyperTest extends AirSpec:
     typed.tpe shouldBe BooleanType
 
   test("TyperRules should produce ErrorType for type mismatches"):
-    given ctx: TyperContext = testContext
+    given ctx: Context = testContext
 
     val left = LongLiteral(10, "10", Span.NoSpan)
     left.tpe = LongType
@@ -135,7 +139,7 @@ class TyperTest extends AirSpec:
     typed.tpe.isInstanceOf[ErrorType] shouldBe true
 
   test("TyperRules should produce ErrorType for comparison type mismatches"):
-    given ctx: TyperContext = testContext
+    given ctx: Context = testContext
 
     // Long < String should error
     val left1 = LongLiteral(10, "10", Span.NoSpan)
@@ -158,7 +162,7 @@ class TyperTest extends AirSpec:
     typed2.tpe.isInstanceOf[ErrorType] shouldBe true
 
   test("TyperRules should allow valid comparisons"):
-    given ctx: TyperContext = testContext
+    given ctx: Context = testContext
 
     // Long < Long is valid
     val left1 = LongLiteral(10, "10", Span.NoSpan)
@@ -181,7 +185,7 @@ class TyperTest extends AirSpec:
     typed2.tpe shouldBe BooleanType
 
   test("TyperRules should type Cast expressions"):
-    given ctx: TyperContext = testContext
+    given ctx: Context = testContext
 
     val expr = LongLiteral(42, "42", Span.NoSpan)
     expr.tpe = LongType
@@ -192,7 +196,7 @@ class TyperTest extends AirSpec:
     typed.tpe shouldBe DoubleType
 
   test("TyperRules should type Case expressions with same types"):
-    given ctx: TyperContext = testContext
+    given ctx: Context = testContext
 
     val cond1 = TrueLiteral(Span.NoSpan)
     cond1.tpe = BooleanType
@@ -213,7 +217,7 @@ class TyperTest extends AirSpec:
     typed.tpe shouldBe LongType
 
   test("TyperRules should type Case expressions with type promotion"):
-    given ctx: TyperContext = testContext
+    given ctx: Context = testContext
 
     val cond1 = TrueLiteral(Span.NoSpan)
     cond1.tpe = BooleanType
@@ -235,7 +239,7 @@ class TyperTest extends AirSpec:
     typed.tpe shouldBe DoubleType
 
   test("TyperRules should type Case expressions with ELSE clause"):
-    given ctx: TyperContext = testContext
+    given ctx: Context = testContext
 
     val cond1 = TrueLiteral(Span.NoSpan)
     cond1.tpe = BooleanType
@@ -253,7 +257,7 @@ class TyperTest extends AirSpec:
     typed.tpe shouldBe DoubleType
 
   test("TyperRules should type FunctionApply expressions"):
-    given ctx: TyperContext = testContext
+    given ctx: Context = testContext
 
     // Create a function type with StringType as return type
     val funcType = Type.FunctionType(
@@ -278,7 +282,7 @@ class TyperTest extends AirSpec:
     typed.tpe shouldBe StringType
 
   test("TyperRules should type DotRef with SchemaType"):
-    given ctx: TyperContext = testContext
+    given ctx: Context = testContext
 
     val schema = SchemaType(
       parent = None,
@@ -300,7 +304,7 @@ class TyperTest extends AirSpec:
     typed.tpe shouldBe StringType
 
   test("TyperRules should produce ErrorType for DotRef with non-existent field"):
-    given ctx: TyperContext = testContext
+    given ctx: Context = testContext
 
     val schema = SchemaType(
       parent = None,
@@ -323,7 +327,7 @@ class TyperTest extends AirSpec:
     typed.tpe.asInstanceOf[ErrorType].msg.shouldContain("nonexistent")
 
   test("TyperRules should return NoType for DotRef when qualifier has NoType"):
-    given ctx: TyperContext = testContext
+    given ctx: Context = testContext
 
     val qualifier = UnquotedIdentifier("unknown", Span.NoSpan)
     // qualifier.tpe is NoType by default
@@ -336,7 +340,7 @@ class TyperTest extends AirSpec:
     typed.tpe shouldBe NoType
 
   test("TyperRules should propagate ErrorType from DotRef qualifier"):
-    given ctx: TyperContext = testContext
+    given ctx: Context = testContext
 
     val qualifier = UnquotedIdentifier("bad", Span.NoSpan)
     qualifier.tpe = ErrorType("Unresolved identifier: bad")
@@ -350,7 +354,7 @@ class TyperTest extends AirSpec:
     typed.tpe.asInstanceOf[ErrorType].msg.shouldContain("Unresolved identifier: bad")
 
   test("TyperRules should produce ErrorType for DotRef on primitive type"):
-    given ctx: TyperContext = testContext
+    given ctx: Context = testContext
 
     val qualifier = LongLiteral(42, "42", Span.NoSpan)
     qualifier.tpe = LongType
@@ -365,7 +369,7 @@ class TyperTest extends AirSpec:
     typed.tpe.asInstanceOf[ErrorType].msg.shouldContain("does not support field access")
 
   test("TyperRules should produce ErrorType for Case expressions with incompatible types"):
-    given ctx: TyperContext = testContext
+    given ctx: Context = testContext
 
     val cond1 = TrueLiteral(Span.NoSpan)
     cond1.tpe = BooleanType
@@ -385,5 +389,200 @@ class TyperTest extends AirSpec:
 
     // Should produce ErrorType for incompatible types (String vs Long)
     typed.tpe.isInstanceOf[ErrorType] shouldBe true
+
+  // ============================================
+  // Context and TyperState tests
+  // ============================================
+
+  test("TyperState should track inputType"):
+    val state = TyperState.empty
+    state.inputType shouldBe DataType.EmptyRelationType
+
+    val schema = SchemaType(
+      parent = None,
+      typeName = Name.typeName("test"),
+      columnTypes = List(NamedType(Name.termName("id"), LongType))
+    )
+    val updated = state.withInputType(schema)
+    updated.inputType shouldBe schema
+
+  test("Context.withInputType should propagate to typerState"):
+    val ctx = testContext
+    ctx.inputType shouldBe DataType.EmptyRelationType
+
+    val schema = SchemaType(
+      parent = None,
+      typeName = Name.typeName("test"),
+      columnTypes = List(NamedType(Name.termName("name"), StringType))
+    )
+    val updated = ctx.withInputType(schema)
+    updated.inputType shouldBe schema
+
+  test("Context.newContext should create child context with inherited typerState"):
+    val ctx    = testContext
+    val schema = SchemaType(
+      parent = None,
+      typeName = Name.typeName("test"),
+      columnTypes = List(NamedType(Name.termName("x"), LongType))
+    )
+    val ctxWithInput = ctx.withInputType(schema)
+
+    val childCtx = ctxWithInput.newContext(Symbol.NoSymbol)
+    // Child context should inherit typerState
+    childCtx.inputType shouldBe schema
+
+  test("TyperRules.identifierRules should resolve from inputType"):
+    val schema = SchemaType(
+      parent = None,
+      typeName = Name.typeName("users"),
+      columnTypes = List(
+        NamedType(Name.termName("id"), LongType),
+        NamedType(Name.termName("name"), StringType)
+      )
+    )
+    given ctx: Context = testContext.withInputType(schema)
+
+    val idExpr = UnquotedIdentifier("name", Span.NoSpan)
+    val typed  = TyperRules.identifierRules.apply(idExpr)
+
+    typed.tpe shouldBe StringType
+
+  test("TyperRules.identifierRules should produce ErrorType for unknown column"):
+    val schema = SchemaType(
+      parent = None,
+      typeName = Name.typeName("users"),
+      columnTypes = List(NamedType(Name.termName("id"), LongType))
+    )
+    given ctx: Context = testContext.withInputType(schema)
+
+    val idExpr = UnquotedIdentifier("unknown", Span.NoSpan)
+    val typed  = TyperRules.identifierRules.apply(idExpr)
+
+    typed.tpe.isInstanceOf[ErrorType] shouldBe true
+
+  // ============================================
+  // Relation typing tests
+  // ============================================
+
+  test("TyperRules.relationRules should set tpe from relationType"):
+    given ctx: Context = testContext
+
+    // Create a simple Values relation with a schema
+    val schema = SchemaType(
+      parent = None,
+      typeName = Name.typeName("test"),
+      columnTypes = List(
+        NamedType(Name.termName("id"), LongType),
+        NamedType(Name.termName("name"), StringType)
+      )
+    )
+    val values = Values(Nil, schema, Span.NoSpan)
+
+    // Before typing, tpe should be NoType
+    values.tpe shouldBe NoType
+
+    // Apply relation rules
+    val typed = TyperRules.relationRules.apply(values)
+
+    // After typing, tpe should be set to relationType
+    typed.tpe shouldBe values.relationType
+    typed.tpe shouldBe schema
+
+  // ============================================
+  // Statement typing tests
+  // ============================================
+
+  test("TyperRules.typeStatement should type PackageDef with PackageType"):
+    given ctx: Context = testContext
+
+    val packageDef = PackageDef(
+      name = wvlet
+        .lang
+        .model
+        .expr
+        .DotRef(
+          wvlet.lang.model.expr.UnquotedIdentifier("test", Span.NoSpan),
+          wvlet.lang.model.expr.UnquotedIdentifier("pkg", Span.NoSpan),
+          DataType.UnknownType,
+          Span.NoSpan
+        ),
+      statements = Nil,
+      span = Span.NoSpan
+    )
+
+    // Before typing, tpe should be NoType
+    packageDef.tpe shouldBe NoType
+
+    // Apply statement typing
+    TyperRules.typeStatement(packageDef)
+
+    // After typing, tpe should be PackageType
+    packageDef.tpe.isInstanceOf[Type.PackageType] shouldBe true
+
+  test("TyperRules.typeStatement should type Import with ImportType"):
+    given ctx: Context = testContext
+
+    val importDef = Import(
+      importRef = wvlet.lang.model.expr.UnquotedIdentifier("some_module", Span.NoSpan),
+      alias = None,
+      fromSource = None,
+      span = Span.NoSpan
+    )
+
+    // Before typing, tpe should be NoType
+    importDef.tpe shouldBe NoType
+
+    // Apply statement typing
+    TyperRules.typeStatement(importDef)
+
+    // After typing, tpe should be ImportType
+    importDef.tpe.isInstanceOf[Type.ImportType] shouldBe true
+
+  // ============================================
+  // TypeInference tests
+  // ============================================
+
+  test("TypeInference.findCommonType should return same type when all types match"):
+    TypeInference.findCommonType(Seq(IntType, IntType, IntType)) shouldBe IntType
+    TypeInference.findCommonType(Seq(StringType, StringType)) shouldBe StringType
+
+  test("TypeInference.findCommonType should promote numeric types"):
+    TypeInference.findCommonType(Seq(IntType, LongType)) shouldBe LongType
+    TypeInference.findCommonType(Seq(IntType, DoubleType)) shouldBe DoubleType
+    TypeInference.findCommonType(Seq(FloatType, DoubleType)) shouldBe DoubleType
+    TypeInference.findCommonType(Seq(IntType, LongType, FloatType, DoubleType)) shouldBe DoubleType
+
+  test("TypeInference.findCommonType should handle NullType"):
+    TypeInference.findCommonType(Seq(NullType, IntType)) shouldBe IntType
+    TypeInference.findCommonType(Seq(StringType, NullType)) shouldBe StringType
+    TypeInference.findCommonType(Seq(NullType, NullType)) shouldBe NullType
+
+  test("TypeInference.findCommonType should return NoType for empty list"):
+    TypeInference.findCommonType(Seq.empty) shouldBe NoType
+
+  test("TypeInference.findCommonType should return ErrorType for incompatible types"):
+    val result = TypeInference.findCommonType(Seq(IntType, BooleanType))
+    result.isInstanceOf[ErrorType] shouldBe true
+
+  test("TypeInference.canCoerce should allow NULL to any type"):
+    TypeInference.canCoerce(NullType, IntType) shouldBe true
+    TypeInference.canCoerce(NullType, StringType) shouldBe true
+
+  test("TypeInference.canCoerce should allow numeric widening"):
+    TypeInference.canCoerce(IntType, LongType) shouldBe true
+    TypeInference.canCoerce(IntType, DoubleType) shouldBe true
+    TypeInference.canCoerce(FloatType, DoubleType) shouldBe true
+    // But not narrowing
+    TypeInference.canCoerce(LongType, IntType) shouldBe false
+    TypeInference.canCoerce(DoubleType, IntType) shouldBe false
+
+  test("TypeInference.unify should find common type"):
+    TypeInference.unify(IntType, IntType) shouldBe IntType
+    TypeInference.unify(IntType, LongType) shouldBe LongType
+    TypeInference.unify(NullType, StringType) shouldBe StringType
+
+  test("TypeInference.unify should return ErrorType for incompatible types"):
+    val result = TypeInference.unify(IntType, BooleanType)
+    result.isInstanceOf[ErrorType] shouldBe true
 
 end TyperTest
