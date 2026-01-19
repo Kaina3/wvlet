@@ -256,10 +256,10 @@ object WvcMain extends LogSupport:
             // Prepare a compiler with parse-only phases
             val compiler = Compiler(
               CompilerOptions(
-                phases = Compiler.parseOnlyPhases,
                 workEnv = WorkEnv(path = workFolder),
                 sourceFolders = List(workFolder)
-              )
+              ),
+              phases = Compiler.parseOnlyPhases
             )
 
             // Parse SQL
