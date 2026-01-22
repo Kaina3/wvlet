@@ -5,7 +5,6 @@ import wvlet.airframe.launcher.Launcher
 import wvlet.airframe.launcher.command
 import wvlet.lang.BuildInfo
 import wvlet.lang.api.WvletLangException
-import wvlet.lang.cli.WvletMain.isInSbt
 import wvlet.lang.compiler.WorkEnv
 import wvlet.lang.runner.connector.DBConnectorProvider
 import wvlet.lang.server.WvletServer
@@ -59,8 +58,6 @@ class WvletMain(opts: WvletGlobalOption) extends LogSupport:
     catch
       case e: WvletLangException =>
         error(e.getMessage)
-        if !isInSbt then
-          System.exit(1)
         throw e
 
   private def design(compilerOptions: WvletCompilerOption): Design =
@@ -94,6 +91,13 @@ class WvletMain(opts: WvletGlobalOption) extends LogSupport:
     withCompiler(compilerOption) { compiler =>
       val wvlet = compiler.generateWvlet
       println(wvlet)
+    }
+  }
+
+  @command(description = "Analyze query for refactoring opportunities")
+  def analyze_patterns(compilerOption: WvletCompilerOption, patternOption: PatternAnalysisOption): Unit = handleError {
+    withCompiler(compilerOption) { compiler =>
+      compiler.analyzePatterns(patternOption)
     }
   }
 

@@ -211,6 +211,20 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
         unary(o, "offset", o.rows)
       case c: Count =>
         unary(c, "count", Nil)
+      case m: ModelScan =>
+        // ModelScan: reference to a defined model with arguments
+        code(m) {
+          val modelName = text(m.name.fullName)
+          val args =
+            if m.modelArgs.isEmpty then
+              empty
+            else
+              paren(cl(m.modelArgs.map(arg => expr(arg))))
+          if sc.inFromClause then
+            modelName + args
+          else
+            group(text("from") + ws + modelName + args)
+        }
       case t: TableInput =>
         code(t) {
           if sc.inFromClause then
@@ -303,7 +317,14 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
               Nil
             case head :: tail =>
               val hd = relation(head)
-              val tl = tail.map(x => indentedBrace(relation(x)))
+              val tl = tail.map { x =>
+                x match
+                  case _: BracedRelation =>
+                    // Already has braces, don't add another
+                    relation(x)
+                  case _ =>
+                    indentedBrace(relation(x))
+              }
               hd :: tl
 
         // TODO union is not supported in Wvlet. Replace tree to dedup(concat)
@@ -616,7 +637,8 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
         case l: Literal =>
           text(l.stringValue)
         case bq: BackquoteInterpolatedIdentifier =>
-          val p    = expr(bq.prefix)
+          // Only output prefix if it's not empty
+          val prefixDoc = if bq.prefix.isEmpty then text("") else expr(bq.prefix)
           val body = bq
             .parts
             .map {
@@ -625,7 +647,7 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
               case e =>
                 text("${") + expr(e) + text("}")
             }
-          p + text("`") + concat(body) + text("`")
+          prefixDoc + text("`") + concat(body) + text("`")
         case bq: BackQuotedIdentifier =>
           text(s"`${bq.unquotedValue}`")
         case w: Wildcard =>
@@ -797,6 +819,9 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
         case e: Extract =>
           // Convert EXTRACT(field FROM expr) to expr.extract(field)
           expr(e.expr) + text(".extract") + paren(text(s"'${e.interval.toString.toLowerCase}'"))
+        case n: NamedParameter =>
+          // Output named parameter as $name (e.g., $P3)
+          text(s"$$${n.name}")
         case other =>
           unsupportedNode(s"expression ${other}", other.span)
     }
