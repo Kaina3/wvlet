@@ -78,7 +78,8 @@ class RefactoringApplierTest extends AirSpec:
 
   test("ApplyConfig should have sensible defaults"):
     val config = ApplyConfig.default
-    config.topK shouldBe 1
+    // 0 means "all" (no limit)
+    config.topK shouldBe 0
     config.useOptimalSuggestions shouldBe true
     config.modelNamePrefix shouldBe "auto"
 

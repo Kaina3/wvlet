@@ -317,7 +317,14 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
               Nil
             case head :: tail =>
               val hd = relation(head)
-              val tl = tail.map(x => indentedBrace(relation(x)))
+              val tl = tail.map { x =>
+                x match
+                  case _: BracedRelation =>
+                    // Already has braces, don't add another
+                    relation(x)
+                  case _ =>
+                    indentedBrace(relation(x))
+              }
               hd :: tl
 
         // TODO union is not supported in Wvlet. Replace tree to dedup(concat)
@@ -630,7 +637,8 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
         case l: Literal =>
           text(l.stringValue)
         case bq: BackquoteInterpolatedIdentifier =>
-          val p    = expr(bq.prefix)
+          // Only output prefix if it's not empty
+          val prefixDoc = if bq.prefix.isEmpty then text("") else expr(bq.prefix)
           val body = bq
             .parts
             .map {
@@ -639,7 +647,7 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
               case e =>
                 text("${") + expr(e) + text("}")
             }
-          p + text("`") + concat(body) + text("`")
+          prefixDoc + text("`") + concat(body) + text("`")
         case bq: BackQuotedIdentifier =>
           text(s"`${bq.unquotedValue}`")
         case w: Wildcard =>
@@ -811,6 +819,9 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
         case e: Extract =>
           // Convert EXTRACT(field FROM expr) to expr.extract(field)
           expr(e.expr) + text(".extract") + paren(text(s"'${e.interval.toString.toLowerCase}'"))
+        case n: NamedParameter =>
+          // Output named parameter as $name (e.g., $P3)
+          text(s"$$${n.name}")
         case other =>
           unsupportedNode(s"expression ${other}", other.span)
     }

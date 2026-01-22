@@ -291,6 +291,16 @@ object AntiUnifier extends LogSupport:
         val children  = unifyProjections(distincts.map(_.child), ctx)
         Distinct(children, NoSpan)
 
+      case _: Dedup =>
+        val dedups   = plans.map(_.asInstanceOf[Dedup])
+        val children = unifyRelations(dedups.map(_.child), ctx)
+        Dedup(children, NoSpan)
+
+      case _: Query =>
+        val queries  = plans.map(_.asInstanceOf[Query])
+        val children = unifyRelations(queries.map(_.child), ctx)
+        Query(children, NoSpan)
+
       case _: AliasedRelation =>
         val aliased   = plans.map(_.asInstanceOf[AliasedRelation])
         val children  = unifyRelations(aliased.map(_.child), ctx)
@@ -333,6 +343,18 @@ object AntiUnifier extends LogSupport:
         val right     = unifyRelations(concats.map(_.right), ctx)
         Concat(left, right, NoSpan)
 
+      // === Write operations ===
+      case _: AppendTo =>
+        val appends   = plans.map(_.asInstanceOf[AppendTo])
+        val children  = unifyRelations(appends.map(_.child), ctx)
+        val targets   = appends.map(_.target.toString)
+        if targets.distinct.size == 1 then
+          AppendTo(children, appends.head.target, appends.head.columns, NoSpan)
+        else
+          val paramId = ctx.createParameter(targets, "append_target")
+          // TableOrFileName is StringLiteral | QualifiedName, tableNameParamRef returns a QualifiedName
+          AppendTo(children, tableNameParamRef(paramId), appends.head.columns, NoSpan)
+
       // === Leaf nodes ===
       case _: TableRef =>
         val refs      = plans.map(_.asInstanceOf[TableRef])
@@ -342,8 +364,7 @@ object AntiUnifier extends LogSupport:
         else
           // Different table names - create parameter
           val paramId = ctx.createParameter(names, "table_ref")
-          // Return first table ref (pattern will use parameter)
-          refs.head
+          TableRef(tableNameParamRef(paramId), NoSpan)
 
       case _: TableScan =>
         val scans     = plans.map(_.asInstanceOf[TableScan])
@@ -352,23 +373,34 @@ object AntiUnifier extends LogSupport:
           scans.head
         else
           val paramId = ctx.createParameter(names, "table_scan")
-          scans.head
+          // TableScan uses Catalog.TableName, which can't represent an interpolated identifier.
+          // For generalized patterns, emit a TableRef with a backquote-interpolated identifier.
+          TableRef(tableNameParamRef(paramId), NoSpan)
 
       // === Other nodes - try to unify children recursively ===
       case other =>
         debug(s"Unifying node type with generic handler: ${other.getClass.getSimpleName}")
         // For unknown nodes, attempt to unify children recursively
         val children = plans.map(_.children)
-        if children.nonEmpty && children.map(_.size).distinct.size == 1 then
+        if children.nonEmpty && children.map(_.size).distinct.size == 1 && children.head.nonEmpty then
           // All plans have same number of children
           val numChildren = children.head.size
           val unifiedChildren = (0 until numChildren).map { i =>
             val childPlans = children.map(_(i))
             unifyPlans(childPlans, ctx)
           }.toList
-          // Return first plan structure with unified children
-          // Note: This is a best-effort approach for unsupported node types
-          plans.head
+          
+          // Reconstruct the node with unified children using mapChildren
+          var childIdx = 0
+          val result = plans.head.mapChildren { _ =>
+            val unified = if childIdx < unifiedChildren.size then
+              unifiedChildren(childIdx)
+            else
+              plans.head.children(childIdx)
+            childIdx += 1
+            unified
+          }
+          result
         else
           // Different child structures - return first as is
           plans.head
@@ -378,6 +410,20 @@ object AntiUnifier extends LogSupport:
     */
   private def unifyRelations(relations: List[Relation], ctx: UnificationContext): Relation =
     unifyPlans(relations, ctx).asInstanceOf[Relation]
+
+  /**
+    * Create a QualifiedName that refers to a named parameter (e.g., $P3) as an interpolated identifier.
+    * This is used for parameterizing table names in patterns so that generated models actually use
+    * their table-name arguments instead of hard-coding the first occurrence.
+    */
+  private def tableNameParamRef(paramId: String): QualifiedName =
+    val paramName = paramId.stripPrefix("$")
+    BackquoteInterpolatedIdentifier(
+      prefix = NameExpr.EmptyName,
+      parts = List(NamedParameter(paramName, NoSpan)),
+      dataType = DataType.UnknownType,
+      span = NoSpan
+    )
 
   /**
     * Unify a list of Project nodes (wrapper for Distinct)
@@ -434,8 +480,8 @@ object AntiUnifier extends LogSupport:
     val exprTypes = exprs.map(_.getClass).distinct
     if exprTypes.size != 1 then
       // Different expression types - cannot unify structurally, parameterize
-      ctx.createParameter(exprs, position)
-      return NamedParameter(position, NoSpan)
+      val paramId = ctx.createParameter(exprs, position)
+      return NamedParameter(paramId.stripPrefix("$"), NoSpan)
 
     exprs.head match
       // === Literals ===
@@ -446,7 +492,7 @@ object AntiUnifier extends LogSupport:
           literals.head
         else
           val paramId = ctx.createParameter(values, position)
-          NamedParameter(paramId, NoSpan)
+          NamedParameter(paramId.stripPrefix("$"), NoSpan)
 
       // === Identifiers ===
       case _: Identifier =>
@@ -456,7 +502,7 @@ object AntiUnifier extends LogSupport:
           ids.head
         else
           val paramId = ctx.createParameter(values, position)
-          NamedParameter(paramId, NoSpan)
+          NamedParameter(paramId.stripPrefix("$"), NoSpan)
 
       case _: QualifiedName =>
         val qnames = exprs.map(_.asInstanceOf[QualifiedName])
@@ -465,7 +511,7 @@ object AntiUnifier extends LogSupport:
           qnames.head
         else
           val paramId = ctx.createParameter(values, position)
-          NamedParameter(paramId, NoSpan)
+          NamedParameter(paramId.stripPrefix("$"), NoSpan)
 
       // === Binary expressions ===
       case _: Eq =>

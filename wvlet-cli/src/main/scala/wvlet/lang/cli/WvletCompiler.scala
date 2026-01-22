@@ -82,8 +82,8 @@ case class PatternAnalysisOption(
     pattern: String = "*.wv",
     @option(prefix = "--apply", description = "Apply top suggestions and output refactored Wvlet code")
     apply: Boolean = false,
-    @option(prefix = "--apply-top", description = "Number of top suggestions to apply (default: 1)")
-    applyTop: Int = 1,
+    @option(prefix = "--apply-top", description = "Number of top suggestions to apply (0 = all, default: 0)")
+    applyTop: Int = 0,
     @option(prefix = "--model-prefix", description = "Prefix for generated model names (default: auto)")
     modelPrefix: String = "auto",
     @option(prefix = "--output-dir", description = "Output directory for refactored files (multi-file mode)")
@@ -91,7 +91,9 @@ case class PatternAnalysisOption(
     @option(prefix = "--model-file", description = "File name for extracted model definitions (default: _models.wv)")
     modelFile: String = "_models.wv",
     @option(prefix = "--suffix", description = "Suffix for refactored file names (default: _refactored)")
-    suffix: String = "_refactored"
+    suffix: String = "_refactored",
+    @option(prefix = "--overwrite", description = "Overwrite original files instead of creating new files with suffix")
+    overwrite: Boolean = false
 )
 
 class WvletCompiler(
@@ -325,9 +327,12 @@ class WvletCompiler(
     import wvlet.lang.compiler.codegen.{WvletGenerator, CodeFormatterConfig}
 
     // Configure the applier
+    // Use per-file selection mode to include subsumed patterns that can be applied
+    // without conflicting with higher-scoring patterns
     val applyConfig = ApplyConfig(
       topK = patternOption.applyTop,
       useOptimalSuggestions = true,
+      usePerFileSelection = true,  // Enable per-file greedy selection with all suggestions
       modelNamePrefix = patternOption.modelPrefix,
       skipIfOverlaps = true,
       requireVariableParams = false  // Allow patterns without variable params
@@ -376,12 +381,15 @@ class WvletCompiler(
     *
     * - Each input file is written as {basename}{suffix}.wv to outputDir
     * - Shared model definitions are written to {modelFile} in outputDir
+    * - Analysis summary is written to _analysis_summary.txt in outputDir
     */
   private def applyAndOutputMultipleRefactorings(
       inputDir: String,
       namedPlans: List[(String, LogicalPlan)],
       extraction: PatternExtractionResult,
-      patternOption: PatternAnalysisOption
+      patternOption: PatternAnalysisOption,
+      fileCount: Int,
+      totalOriginalNodes: Int
   ): Unit =
     import java.io.{File, PrintWriter}
     import java.nio.file.{Files, Paths}
@@ -389,9 +397,12 @@ class WvletCompiler(
     import wvlet.lang.compiler.Context
 
     // Configure the applier
+    // Use per-file selection mode to include subsumed patterns that can be applied
+    // without conflicting with higher-scoring patterns
     val applyConfig = ApplyConfig(
       topK = patternOption.applyTop,
       useOptimalSuggestions = true,
+      usePerFileSelection = true,  // Enable per-file greedy selection with all suggestions
       modelNamePrefix = patternOption.modelPrefix,
       skipIfOverlaps = true,
       requireVariableParams = false  // Allow patterns without variable params
@@ -445,28 +456,33 @@ class WvletCompiler(
     var filesWritten = 0
     multiResult.fileResults.foreach { case (originalName, plan) =>
       val baseName = originalName.stripSuffix(".wv")
-      val outputFileName = s"${baseName}${patternOption.suffix}.wv"
+      val outputFileName = 
+        if patternOption.overwrite then s"${baseName}.wv"
+        else s"${baseName}${patternOption.suffix}.wv"
       val outputFilePath = outputPath.resolve(outputFileName)
-      
-      // Add import comment for model file
-      val fileHeader = new StringBuilder
-      fileHeader.append(s"// Auto-refactored by Wvlet Pattern Analyzer\n")
-      fileHeader.append(s"// Original file: ${originalName}\n")
-      if multiResult.models.nonEmpty then
-        fileHeader.append(s"// Models defined in: ${patternOption.modelFile}\n")
-      fileHeader.append("\n")
       
       val code = generator.print(plan)
       
       val pw = new PrintWriter(outputFilePath.toFile)
       try
-        pw.print(fileHeader.toString + code)
+        pw.print(code)
         filesWritten += 1
       finally
         pw.close()
     }
 
     println(s"Wrote ${filesWritten} refactored files to: ${outputDir}")
+
+    // Write analysis summary
+    val summaryFilePath = outputPath.resolve("_analysis_summary.txt")
+    val summaryContent = formatTextResult(extraction, patternOption.top, fileCount, Some(totalOriginalNodes))
+    val summaryPw = new PrintWriter(summaryFilePath.toFile)
+    try
+      summaryPw.print(summaryContent)
+    finally
+      summaryPw.close()
+    println(s"Wrote analysis summary to: ${summaryFilePath}")
+
     println()
     println(multiResult.summary)
 
@@ -486,11 +502,29 @@ class WvletCompiler(
       throw StatusCode.INVALID_ARGUMENT.newException(s"Directory not found: $dirPath")
 
     // Find matching files
-    val matcher   = FileSystems.getDefault.getPathMatcher(s"glob:${patternOption.pattern}")
-    val allFiles  = dir.listFiles().filter(f => f.isFile && matcher.matches(Paths.get(f.getName))).toList.sortBy(_.getName)
+    val matcher = FileSystems.getDefault.getPathMatcher(s"glob:${patternOption.pattern}")
+    val allFiles =
+      dir
+        .listFiles()
+        .filter(f => f.isFile && matcher.matches(Paths.get(f.getName)))
+        .toList
+        .sortBy(_.getName)
+
+    // When applying refactorings in directory mode, avoid re-processing generated artifacts.
+    // Otherwise, running the command repeatedly (or pointing --dir to an output directory)
+    // will generate files like *_refactored_refactored.
+    val inputFiles =
+      if patternOption.apply then
+        allFiles.filterNot { f =>
+          val name = f.getName
+          val base = name.stripSuffix(".wv")
+          name == patternOption.modelFile || name.startsWith("_") || base.endsWith(patternOption.suffix)
+        }
+      else
+        allFiles
     val filesAfterOffset =
-      if patternOption.offset <= 0 then allFiles
-      else allFiles.drop(patternOption.offset)
+      if patternOption.offset <= 0 then inputFiles
+      else inputFiles.drop(patternOption.offset)
     val filesToProcess = patternOption.limit match
       case Some(n) => filesAfterOffset.take(n)
       case None    => filesAfterOffset
@@ -572,7 +606,7 @@ class WvletCompiler(
 
     // Check if we should apply refactorings
     if patternOption.apply then
-      applyAndOutputMultipleRefactorings(dirPath, plans.toList, result, patternOption)
+      applyAndOutputMultipleRefactorings(dirPath, plans.toList, result, patternOption, plans.size, totalOriginalNodes)
     else
       val output = if patternOption.json then
         formatJsonResult(result, plans.size, Some(totalOriginalNodes))
@@ -627,7 +661,8 @@ class WvletCompiler(
       refactorConfig = refactorConfig,
       collectorConfig = collectorConfig,
       detectorConfig = detectorConfig,
-      maxSuggestions = patternOption.top,
+      // When applying refactorings, don't limit suggestions; otherwise use --top
+      maxSuggestions = if patternOption.apply then Int.MaxValue else patternOption.top,
       crossQueryAnalysis = patternOption.dir.isDefined
     )
 

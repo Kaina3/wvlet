@@ -34,7 +34,7 @@ import wvlet.log.LogSupport
 case class RefactorConfig(
     minOccurrences: Int = 2,
     minPatternSize: Int = 3,
-    maxParameters: Int = 5,
+    maxParameters: Int = 6,
     minReduction: Int = 10,
     minReductionRatio: Double = 0.3,
     preferCrossQuery: Boolean = true
@@ -47,9 +47,9 @@ object RefactorConfig:
   val aggressive: RefactorConfig = RefactorConfig(
     minOccurrences = 2,
     minPatternSize = 2,
-    maxParameters = 8,
-    minReduction = 5,
-    minReductionRatio = 0.2
+    maxParameters = 20,  // Higher limit for cross-query patterns with many table/column differences
+    minReduction = Int.MinValue,    // Allow any reduction (even negative) for aggressive cross-query refactoring
+    minReductionRatio = -1.0  // No minimum ratio for aggressive mode
   )
 
   // Conservative refactoring (only significant patterns)
@@ -406,11 +406,24 @@ object RefactoringDecider extends LogSupport:
       result: DuplicateDetectionResult,
       config: RefactorConfig = RefactorConfig.default
   ): HierarchicalSuggestionResult =
-    // First, get all actionable suggestions
-    val baseSuggestions = result.groups.map { group =>
+    // First, evaluate all suggestions and track why they're rejected
+    val allEvaluated = result.groups.map { group =>
       val (decision, unifyResult) = evaluate(group, config)
       RefactoringSuggestion(group, unifyResult, decision)
-    }.filter(_.decision.shouldRefactor)
+    }
+    
+    // Debug: show why groups were rejected
+    val rejected = allEvaluated.filterNot(_.decision.shouldRefactor)
+    if rejected.nonEmpty then
+      println(s"  [RefactoringDecider] ${rejected.size} groups rejected:")
+      rejected.take(5).foreach { s =>
+        println(s"    - nodes=${s.group.nodeCount.toInt}, occ=${s.group.occurrences}, " +
+                s"cross=${s.group.isCrossQuery}: ${s.decision.reason}")
+      }
+      if rejected.size > 5 then
+        println(s"    ... and ${rejected.size - 5} more")
+    
+    val baseSuggestions = allEvaluated.filter(_.decision.shouldRefactor)
 
     if baseSuggestions.isEmpty then
       return HierarchicalSuggestionResult(Nil, Nil, 0, 0)
@@ -424,8 +437,10 @@ object RefactoringDecider extends LogSupport:
       s.copy(rank = idx + 1)
     }
 
-    // Extract optimal suggestions (those not subsumed by any other)
-    val optimal = ranked.filter(_.isOptimal).sortBy(-_.decision.score)
+    // Select optimal suggestions using outside-in evaluation:
+    // Start from outermost patterns, if they are good candidates (positive reduction),
+    // adopt them and exclude their children. If not, consider their children instead.
+    val optimal = selectOptimalOutsideIn(ranked, config)
     val optimalReranked = optimal.zipWithIndex.map { case (s, idx) =>
       s.copy(rank = idx + 1)
     }
@@ -440,6 +455,65 @@ object RefactoringDecider extends LogSupport:
       totalReductionOptimal = totalOptimal
     )
 
+  /**
+    * Select optimal suggestions using greedy score-based selection.
+    *
+    * This method mirrors --apply's per-file greedy selection logic:
+    * 1. Sort all suggestions by score (descending)
+    * 2. For each suggestion, check if it conflicts with already-selected patterns
+    * 3. A pattern conflicts if any of its occurrences overlap (ancestor/descendant) with selected ones
+    * 4. Select non-conflicting patterns
+    *
+    * This ensures the report shows exactly which patterns would be applied with --apply.
+    */
+  private def selectOptimalOutsideIn(
+      suggestions: List[RefactoringSuggestion],
+      config: RefactorConfig
+  ): List[RefactoringSuggestion] =
+    if suggestions.isEmpty then
+      return Nil
+
+    // Filter by variable params (same as --apply)
+    val filtered = suggestions.filter { s =>
+      s.unifyResult.exists(_.variableParameters.nonEmpty)
+    }
+    
+    // Sort by score descending, then by name for deterministic ordering
+    val sorted = filtered.sortBy(s => (-s.decision.score, s.suggestedModelName))
+    
+    // Track covered paths across all files: Set[path]
+    // In cross-query analysis, we need to track by (sourceId, path)
+    val coveredPaths = scala.collection.mutable.Set[(Option[String], List[Int])]()
+    val selected = scala.collection.mutable.ListBuffer[RefactoringSuggestion]()
+    
+    // Helper to check path overlap (ancestor/descendant relationship)
+    def isPathOverlap(path1: List[Int], path2: List[Int]): Boolean =
+      if path1.size <= path2.size then
+        path2.startsWith(path1)
+      else
+        path1.startsWith(path2)
+    
+    sorted.foreach { s =>
+      // Get all occurrence paths for this pattern
+      val occurrencePaths = s.group.subtrees.map(st => (st.sourceId, st.path))
+      
+      // Check if any occurrence conflicts with already-selected patterns
+      val hasConflict = occurrencePaths.exists { case (sourceId, path) =>
+        coveredPaths.exists { case (coveredSourceId, coveredPath) =>
+          sourceId == coveredSourceId && isPathOverlap(path, coveredPath)
+        }
+      }
+      
+      if !hasConflict then
+        // Select this pattern and mark its paths as covered
+        selected += s
+        occurrencePaths.foreach { case (sourceId, path) =>
+          coveredPaths += ((sourceId, path))
+        }
+    }
+    
+    selected.toList
+  
   /**
     * Build containment hierarchy between suggestions.
     *

@@ -24,22 +24,33 @@ import wvlet.log.LogSupport
 /**
   * Configuration for applying refactorings
   *
-  * @param topK Number of top suggestions to apply
-  * @param useOptimalSuggestions Whether to use optimal (non-overlapping) suggestions
+  * @param topK Number of top suggestions to apply (0 = all)
+  * @param useOptimalSuggestions Whether to use optimal (non-overlapping) suggestions (single-file only)
   * @param modelNamePrefix Prefix for generated model names
   * @param skipIfOverlaps Whether to skip suggestions that would conflict with already-applied ones
   * @param requireVariableParams Only apply suggestions that have variable parameters
+  * @param perFileMinOccurrences For multi-file apply: minimum occurrences per file to apply a pattern there
+  * @param usePerFileSelection For multi-file apply: use per-file greedy selection instead of global optimal
   */
 case class ApplyConfig(
-    topK: Int = 1,
+    topK: Int = 0,
     useOptimalSuggestions: Boolean = true,
     modelNamePrefix: String = "auto",
     skipIfOverlaps: Boolean = true,
-    requireVariableParams: Boolean = true
+    requireVariableParams: Boolean = true,
+    perFileMinOccurrences: Int = 2,
+    usePerFileSelection: Boolean = true
 )
 
 object ApplyConfig:
   val default: ApplyConfig = ApplyConfig()
+  
+  /** Config for multi-file apply with per-file selection (recommended) */
+  val multiFile: ApplyConfig = ApplyConfig(
+    useOptimalSuggestions = false, // We use per-file selection instead
+    usePerFileSelection = true,
+    perFileMinOccurrences = 2
+  )
 
 /**
   * Information about a successfully applied refactoring
@@ -160,11 +171,11 @@ object RefactoringApplier extends LogSupport:
     else
       extraction.suggestions
 
-    // Filter and take top K
-    val candidateSuggestions = suggestions
+    // Filter and take top K (0 = all)
+    val filtered = suggestions
       .filter(s => s.decision.shouldRefactor)
       .filter(s => !config.requireVariableParams || s.unifyResult.exists(_.variableParameters.nonEmpty))
-      .take(config.topK)
+    val candidateSuggestions = if config.topK <= 0 then filtered else filtered.take(config.topK)
 
     if candidateSuggestions.isEmpty then
       return ApplyResult(root, Nil, List(SkippedRefactoring("all", "No applicable suggestions found")))
@@ -377,10 +388,11 @@ object RefactoringApplier extends LogSupport:
   /**
     * Apply refactorings to multiple files based on cross-query pattern extraction.
     *
-    * This method:
-    * 1. Generates shared ModelDefs for patterns found across files
-    * 2. Transforms each file's plan by replacing occurrences with ModelScan
-    * 3. Returns models separately (for a shared model file) and transformed plans (one per input file)
+    * This method uses per-file greedy selection:
+    * 1. Consider ALL suggestions (including subsumed) sorted by score descending
+    * 2. For each file, greedily select non-conflicting occurrences (>= perFileMinOccurrences)
+    * 3. Generate shared ModelDefs for patterns that are applied somewhere
+    * 4. Transform each file's plan by replacing selected occurrences with ModelScan
     *
     * @param namedPlans List of (fileName, LogicalPlan) tuples
     * @param extraction The cross-query pattern extraction result
@@ -395,17 +407,20 @@ object RefactoringApplier extends LogSupport:
     if !extraction.hasSuggestions then
       return MultiApplyResult(Nil, namedPlans, Nil, Nil)
 
-    // Get suggestions to apply
-    val suggestions = if config.useOptimalSuggestions then
+    // Use all suggestions (including subsumed) for per-file selection mode
+    // Otherwise fall back to optimal-only for backward compatibility
+    val baseSuggestions = if config.usePerFileSelection then
+      extraction.allSuggestions
+    else if config.useOptimalSuggestions then
       extraction.optimalSuggestions
     else
       extraction.suggestions
 
-    // Filter and take top K
-    val candidateSuggestions = suggestions
+    // Filter by shouldRefactor and variable params, then take top K
+    val filtered = baseSuggestions
       .filter(s => s.decision.shouldRefactor)
       .filter(s => !config.requireVariableParams || s.unifyResult.exists(_.variableParameters.nonEmpty))
-      .take(config.topK)
+    val candidateSuggestions = if config.topK <= 0 then filtered else filtered.take(config.topK)
 
     if candidateSuggestions.isEmpty then
       return MultiApplyResult(
@@ -415,84 +430,143 @@ object RefactoringApplier extends LogSupport:
         List(SkippedRefactoring("all", "No applicable suggestions found"))
       )
 
-    // Generate models and collect occurrence info
-    val generatedModels = scala.collection.mutable.ListBuffer[ModelDef]()
-    val applied = scala.collection.mutable.ListBuffer[AppliedRefactoring]()
-    val skipped = scala.collection.mutable.ListBuffer[SkippedRefactoring]()
-    
-    // Map: modelName -> (varParams, unifyResult, occurrences grouped by sourceId/fileName)
-    case class ModelInfo(
+    // Sort candidates by score descending (higher score = higher priority)
+    // Use model name as tiebreaker for deterministic ordering
+    val sortedCandidates = candidateSuggestions.sortBy(s => (-s.decision.score, s.suggestedModelName))
+
+    // Prepare model info for each candidate
+    case class CandidateInfo(
+        suggestion: RefactoringSuggestion,
         modelName: String,
         varParams: List[ExtractedParameter],
         unifyResult: AntiUnifyResult,
+        // Map: sourceId -> List[(subtree, substitution)]
         occurrencesBySource: Map[Option[String], List[(CollectedSubtree, Substitution)]]
     )
-    
-    val modelInfos = scala.collection.mutable.ListBuffer[ModelInfo]()
 
-    candidateSuggestions.foreach { suggestion =>
-      val suggestionId = suggestion.suggestedModelName
-      
-      suggestion.unifyResult match
-        case None =>
-          skipped += SkippedRefactoring(suggestionId, "No anti-unification result")
-          
-        case Some(unifyResult) =>
-          val varParams = unifyResult.variableParameters
-          if config.requireVariableParams && varParams.isEmpty then
-            skipped += SkippedRefactoring(suggestionId, "No variable parameters")
-          else
-            val modelName = s"${config.modelNamePrefix}_${suggestionId}"
-            
-            // Generate ModelDef
-            val modelDef = generateModelDef(modelName, unifyResult)
-            generatedModels += modelDef
-            
-            // Group occurrences by sourceId (file name)
-            val occurrences = suggestion.group.subtrees
-            val occurrencesBySource = occurrences.zipWithIndex.groupBy { case (subtree, idx) =>
-              subtree.sourceId
-            }.map { case (sourceId, items) =>
-              val subtreesWithSubs = items.map { case (subtree, occIdx) =>
-                val substitution = unifyResult.substitutions.lift(occIdx).getOrElse(
-                  unifyResult.substitutions.headOption.getOrElse(Substitution(0, Map.empty))
-                )
-                (subtree, substitution)
-              }
-              sourceId -> subtreesWithSubs
-            }
-            
-            modelInfos += ModelInfo(modelName, varParams, unifyResult, occurrencesBySource)
-            
-            applied += AppliedRefactoring(
-              suggestionId = modelName,
-              modelDef = modelDef,
-              occurrencesReplaced = occurrences.size,
-              nodeReduction = suggestion.decision.estimatedReduction
+    val candidateInfos = sortedCandidates.flatMap { suggestion =>
+      suggestion.unifyResult.map { unifyResult =>
+        val varParams = unifyResult.variableParameters
+        val modelName = s"${config.modelNamePrefix}_${suggestion.suggestedModelName}"
+        
+        // Group occurrences by sourceId (file name)
+        val occurrences = suggestion.group.subtrees
+        val occurrencesBySource = occurrences.zipWithIndex.groupBy { case (subtree, _) =>
+          subtree.sourceId
+        }.map { case (sourceId, items) =>
+          val subtreesWithSubs = items.map { case (subtree, occIdx) =>
+            val substitution = unifyResult.substitutions.lift(occIdx).getOrElse(
+              unifyResult.substitutions.headOption.getOrElse(Substitution(0, Map.empty))
             )
+            (subtree, substitution)
+          }
+          sourceId -> subtreesWithSubs
+        }
+        
+        CandidateInfo(suggestion, modelName, varParams, unifyResult, occurrencesBySource)
+      }
     }
 
-    // Apply replacements to each file's plan
-    val transformedPlans = namedPlans.map { case (fileName, plan) =>
-      // Collect all replacements for this file (match by sourceId = fileName)
-      val replacements = modelInfos.flatMap { info =>
-        info.occurrencesBySource.getOrElse(Some(fileName), Nil).map { case (subtree, substitution) =>
-          val modelScan = generateModelScan(info.modelName, info.varParams, substitution, subtree)
-          (subtree.path, modelScan)
-        }
-      }.toList
-      
-      // Apply replacements if any
-      val transformedPlan = if replacements.nonEmpty then
-        PathRewriter.replaceMany(plan, replacements)
+    // ===== Per-file greedy selection =====
+    // For each file: covered paths, and selected replacements
+    val fileNames = namedPlans.map(_._1).toSet
+    
+    // Track covered paths per file: fileName -> Set[path]
+    val coveredPathsPerFile = scala.collection.mutable.Map[String, scala.collection.mutable.Set[List[Int]]]()
+    fileNames.foreach(f => coveredPathsPerFile(f) = scala.collection.mutable.Set.empty)
+    
+    // Track selected occurrences: fileName -> List[(modelName, varParams, subtree, substitution)]
+    case class SelectedReplacement(
+        modelName: String,
+        varParams: List[ExtractedParameter],
+        subtree: CollectedSubtree,
+        substitution: Substitution
+    )
+    val selectedPerFile = scala.collection.mutable.Map[String, scala.collection.mutable.ListBuffer[SelectedReplacement]]()
+    fileNames.foreach(f => selectedPerFile(f) = scala.collection.mutable.ListBuffer.empty)
+    
+    // Track which models are actually used (so we only generate models that have at least one replacement)
+    val usedModelNames = scala.collection.mutable.Set[String]()
+    
+    // Process candidates in score order
+    candidateInfos.foreach { info =>
+      // Check variable params requirement
+      if config.requireVariableParams && info.varParams.isEmpty then
+        // Skip silently (already filtered, but just in case)
+        ()
       else
-        plan
+        // Count total remaining occurrences across all files (for cross-file patterns)
+        var totalRemainingAcrossFiles = 0
+        val remainingByFile = scala.collection.mutable.Map[String, List[(CollectedSubtree, Substitution)]]()
+        
+        fileNames.foreach { fileName =>
+          val fileOccurrences = info.occurrencesBySource.getOrElse(Some(fileName), Nil)
+          val coveredPaths = coveredPathsPerFile(fileName)
+          
+          // Filter to non-conflicting occurrences
+          val remaining = fileOccurrences.filter { case (subtree, _) =>
+            !coveredPaths.exists(coveredPath => isPathOverlap(subtree.path, coveredPath))
+          }
+          
+          if remaining.nonEmpty then
+            remainingByFile(fileName) = remaining
+            totalRemainingAcrossFiles += remaining.size
+        }
+        
+        // Apply if at least one non-conflicting occurrence remains.
+        // Note: Refactoring candidates are already filtered by minOccurrences during analysis;
+        // here we only drop occurrences due to conflicts.
+        if totalRemainingAcrossFiles >= 1 then
+          remainingByFile.foreach { case (fileName, remaining) =>
+            remaining.foreach { case (subtree, substitution) =>
+              selectedPerFile(fileName) += SelectedReplacement(info.modelName, info.varParams, subtree, substitution)
+              coveredPathsPerFile(fileName) += subtree.path
+            }
+          }
+          usedModelNames += info.modelName
+    }
+    
+    // ===== Generate models for used candidates =====
+    val generatedModels = candidateInfos
+      .filter(info => usedModelNames.contains(info.modelName))
+      .map(info => generateModelDef(info.modelName, info.unifyResult))
+      .toList
+    
+    // ===== Build applied/skipped lists =====
+    val applied = scala.collection.mutable.ListBuffer[AppliedRefactoring]()
+    val skipped = scala.collection.mutable.ListBuffer[SkippedRefactoring]()
+    
+    candidateInfos.foreach { info =>
+      if usedModelNames.contains(info.modelName) then
+        // Count total occurrences replaced across all files
+        val totalReplaced = selectedPerFile.values.flatten.count(_.modelName == info.modelName)
+        applied += AppliedRefactoring(
+          suggestionId = info.modelName,
+          modelDef = generateModelDef(info.modelName, info.unifyResult),
+          occurrencesReplaced = totalReplaced,
+          nodeReduction = info.suggestion.decision.estimatedReduction
+        )
+      else
+        skipped += SkippedRefactoring(info.modelName, "No non-conflicting occurrences remained")
+    }
+
+    // ===== Apply replacements to each file's plan =====
+    val transformedPlans = namedPlans.map { case (fileName, plan) =>
+      val selections = selectedPerFile(fileName).toList
       
-      (fileName, transformedPlan)
+      if selections.isEmpty then
+        (fileName, plan)
+      else
+        val replacements = selections.map { sel =>
+          val modelScan = generateModelScan(sel.modelName, sel.varParams, sel.substitution, sel.subtree)
+          (sel.subtree.path, modelScan)
+        }
+        val transformedPlan = PathRewriter.replaceMany(plan, replacements)
+        (fileName, transformedPlan)
     }
 
     MultiApplyResult(
-      models = generatedModels.toList,
+      models = generatedModels,
       fileResults = transformedPlans,
       applied = applied.toList,
       skipped = skipped.toList

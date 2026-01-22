@@ -101,6 +101,13 @@ case class PatternExtractionResult(
   def subsumedCount: Int =
     hierarchyResult.map(_.allSuggestions.count(_.subsumedBy.isDefined)).getOrElse(0)
 
+  /**
+    * All suggestions including subsumed ones.
+    * For multi-file apply, we use this to consider all candidates and decide per-file.
+    */
+  def allSuggestions: List[RefactoringSuggestion] =
+    hierarchyResult.map(_.allSuggestions).getOrElse(suggestions)
+
 end PatternExtractionResult
 
 /**

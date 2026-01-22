@@ -109,6 +109,8 @@ object PathRewriter extends LogSupport:
         p.copy(child = newChildren.head.asInstanceOf[Relation])
       case s: Sample =>
         s.copy(child = newChildren.head.asInstanceOf[Relation])
+      case d: Dedup =>
+        d.copy(child = newChildren.head.asInstanceOf[Relation])
         
       // === Binary relations ===
       case j: Join =>
@@ -136,6 +138,13 @@ object PathRewriter extends LogSupport:
             node
       case e: Except =>
         e.copy(left = newChildren(0).asInstanceOf[Relation], right = newChildren(1).asInstanceOf[Relation])
+      case c: Concat =>
+        childIndex match
+          case 0 => c.copy(left = newChildren(0).asInstanceOf[Relation])
+          case 1 => c.copy(right = newChildren(1).asInstanceOf[Relation])
+          case _ =>
+            warn(s"Unexpected child index $childIndex for Concat")
+            node
         
       // === Query wrappers ===
       case q: Query =>
@@ -144,6 +153,14 @@ object PathRewriter extends LogSupport:
         // WithQuery.children returns empty list by design (queryDefs are prerequisites, not children)
         // So we need special handling
         w.copy(queryBody = newChild.asInstanceOf[Relation])
+        
+      // === Save operations ===
+      case a: AppendTo =>
+        a.copy(child = newChildren.head.asInstanceOf[Relation])
+      case d: Delete =>
+        d.copy(child = newChildren.head.asInstanceOf[Relation])
+      case s: SaveTo =>
+        s.copy(child = newChildren.head.asInstanceOf[Relation])
         
       // === Package/top-level ===
       case p: PackageDef =>
@@ -154,6 +171,12 @@ object PathRewriter extends LogSupport:
         c.copy(child = newChildren.head.asInstanceOf[Relation])
       case b: BracedRelation =>
         b.copy(child = newChildren.head.asInstanceOf[Relation])
+      case t: TestRelation =>
+        t.copy(child = newChildren.head.asInstanceOf[Relation])
+      case l: Lateral =>
+        l.copy(query = newChildren.head.asInstanceOf[Relation])
+      case u: Unpivot =>
+        u.copy(child = newChildren.head.asInstanceOf[Relation])
       case d: Debug =>
         childIndex match
           case 0 => d.copy(child = newChildren(0).asInstanceOf[Relation])
@@ -176,17 +199,15 @@ object PathRewriter extends LogSupport:
       copyMethod match
         case Some(method) =>
           // Get current field values using Product interface
-          node match
-            case p: Product =>
-              val currentValues = (0 until p.productArity).map(p.productElement).toArray
-              
-              // Find which field corresponds to the child at childIndex
-              // This is tricky because children might not align with product fields
-              // For now, we'll just warn and return the original
-              warn(s"Reflective copy for ${node.getClass.getSimpleName} not fully implemented, returning original")
-              node
-            case _ =>
-              node
+          // All LogicalPlan nodes extend Product, so this will always match
+          val p = node.asInstanceOf[Product]
+          val currentValues = (0 until p.productArity).map(p.productElement).toArray
+          
+          // Find which field corresponds to the child at childIndex
+          // This is tricky because children might not align with product fields
+          // For now, we'll just warn and return the original
+          warn(s"Reflective copy for ${node.getClass.getSimpleName} not fully implemented, returning original")
+          node
         case None =>
           warn(s"No copy method found for ${node.getClass.getSimpleName}")
           node

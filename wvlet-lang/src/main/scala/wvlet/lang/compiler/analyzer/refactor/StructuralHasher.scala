@@ -83,13 +83,13 @@ object StructuralHasher extends LogSupport:
     plan match
       // === Leaf nodes ===
       case t: TableRef =>
-        combineHash("TableRef", if config.ignoreAliases then 0 else t.name.fullName.hashCode)
+        combineHash("TableRef", if config.ignoreIdentifiers then 0 else t.name.fullName.hashCode)
 
       case t: TableScan =>
-        combineHash("TableScan", if config.ignoreAliases then 0 else t.name.fullName.hashCode)
+        combineHash("TableScan", if config.ignoreIdentifiers then 0 else t.name.fullName.hashCode)
 
       case t: FileScan =>
-        combineHash("FileScan", if config.ignoreAliases then 0 else t.path.hashCode)
+        combineHash("FileScan", if config.ignoreIdentifiers then 0 else t.path.hashCode)
 
       case v: Values =>
         combineHash(

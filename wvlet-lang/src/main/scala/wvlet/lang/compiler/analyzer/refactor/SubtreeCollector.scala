@@ -216,7 +216,7 @@ object SubtreeCollector extends LogSupport:
     node match
       // Always refactorable relation nodes
       case _: Filter | _: Project | _: Join | _: GroupBy | _: Agg | _: Sort | _: Distinct |
-          _: Union | _: Intersect | _: Except | _: Limit | _: Pivot =>
+          _: Union | _: Intersect | _: Except | _: Limit | _: Pivot | _: Concat | _: Dedup =>
         true
 
       // Leaf nodes (configurable)
@@ -229,6 +229,10 @@ object SubtreeCollector extends LogSupport:
 
       // Model references and CTE/WithQuery
       case _: ModelScan | _: WithQuery =>
+        true
+        
+      // Write operations (Append, Save, etc.) - collect the child query for pattern analysis
+      case _: Save | _: AppendTo =>
         true
 
       // Other nodes - don't collect
