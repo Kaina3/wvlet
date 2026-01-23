@@ -101,4 +101,12 @@ class WvletMain(opts: WvletGlobalOption) extends LogSupport:
     }
   }
 
+  @command(description = "Show logical plan of a query")
+  def show_plan(compilerOption: WvletCompilerOption): Unit = handleError {
+    withCompiler(compilerOption) { compiler =>
+      val plan = compiler.showLogicalPlan
+      println(plan)
+    }
+  }
+
 end WvletMain
