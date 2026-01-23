@@ -19,6 +19,8 @@ import wvlet.lang.compiler.Phase
 import wvlet.lang.compiler.Symbol
 import wvlet.lang.compiler.WorkEnv
 import wvlet.lang.compiler.analyzer.refactor.*
+import wvlet.lang.compiler.transform.JoinFlattener
+import wvlet.lang.compiler.transform.RewriteExpr
 import wvlet.lang.model.plan.LogicalPlan
 import wvlet.lang.model.plan.PackageDef
 import wvlet.lang.model.expr.NameExpr
@@ -26,6 +28,10 @@ import wvlet.lang.runner.QueryExecutor
 import wvlet.lang.runner.connector.DBConnector
 import wvlet.lang.runner.connector.DBConnectorProvider
 import wvlet.log.LogSupport
+
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Path, Paths}
+import scala.jdk.CollectionConverters.*
 
 case class WvletCompilerOption(
     @option(prefix = "-w", description = "Working folder")
@@ -94,6 +100,30 @@ case class PatternAnalysisOption(
     suffix: String = "_refactored",
     @option(prefix = "--overwrite", description = "Overwrite original files instead of creating new files with suffix")
     overwrite: Boolean = false
+)
+
+/**
+  * Options for converting a directory of SQL files into Wvlet files
+  */
+case class SqlToWvletDirOption(
+    @option(prefix = "--sql-dir", description = "Directory of .sql files to convert")
+    sqlDir: String,
+    @option(prefix = "--output-dir", description = "Output directory for generated .wv files")
+    outputDir: String,
+    @option(prefix = "--sql-pattern", description = "File pattern to match (default: *.sql)")
+    pattern: String = "*.sql",
+    @option(prefix = "--offset", description = "Skip first N files (for batch processing)")
+    offset: Int = 0,
+    @option(prefix = "--limit", description = "Limit number of files to convert")
+    limit: Option[Int] = None,
+    @option(prefix = "--suffix", description = "Suffix for output file names (default: empty)")
+    suffix: String = "",
+    @option(prefix = "--overwrite", description = "Overwrite existing output files")
+    overwrite: Boolean = false,
+    @option(prefix = "--parse-only", description = "Parse-only mode for faster conversion")
+    parseOnly: Boolean = true,
+    @option(prefix = "--continue-on-error", description = "Continue converting other files when an error occurs")
+    continueOnError: Boolean = true
 )
 
 class WvletCompiler(
@@ -209,11 +239,16 @@ class WvletCompiler(
 
   def generateWvlet: String =
     val inputUnit = getInputUnit(forSQL = true)
-    // For SQL to Wvlet conversion, we only need to parse the SQL, not run full compilation
+    // For SQL to Wvlet conversion, parsing is usually sufficient.
+    // We apply lightweight plan rewrites (e.g., join flattening) explicitly below.
     val ctx = compileInternal(inputUnit, parseOnly = inputUnit.sourceFile.isSQL)
 
-    // Get the resolved logical plan from the compilation unit
-    val logicalPlan = inputUnit.resolvedPlan
+    // Get the resolved logical plan from the compilation unit and apply minimal rewrites.
+    // NOTE: Compiler.parseOnly does not run transform phases, so we run these explicitly.
+    val logicalPlan =
+      val unresolved = inputUnit.resolvedPlan
+      val rewritten  = RewriteExpr.rewriteOnly(unresolved)
+      JoinFlattener.rewriteOnly(rewritten)
 
     // Create a WvletGenerator with the appropriate database type configuration
     val config    = CodeFormatterConfig(sqlDBType = ctx.dbType)
@@ -232,6 +267,79 @@ class WvletCompiler(
     // Use LogicalPlanPrinter to generate a string representation of the logical plan
     import wvlet.lang.model.plan.LogicalPlanPrinter
     LogicalPlanPrinter.print(logicalPlan)(using ctx)
+
+  private def generateWvletFromSqlFilePath(sqlFilePath: String, parseOnly: Boolean): String =
+    val inputUnit = CompilationUnit.fromFile(sqlFilePath)
+    val parentDir = Option(Paths.get(sqlFilePath).getParent).map(_.toString).getOrElse(compilerOption.workFolder)
+
+    // For SQL to Wvlet conversion, parsing is usually sufficient.
+    // Some readability transforms are handled in codegen (e.g., join flattening) even in parse-only mode.
+    val ctx = compileInternal(inputUnit, parseOnly = parseOnly, sourceFolders = List(parentDir))
+
+    val logicalPlan =
+      val unresolved = inputUnit.resolvedPlan
+      val rewritten  = RewriteExpr.rewriteOnly(unresolved)
+      JoinFlattener.rewriteOnly(rewritten)
+    val config      = CodeFormatterConfig(sqlDBType = ctx.dbType)
+    val generator   = WvletGenerator(config)(using ctx)
+    generator.print(logicalPlan)
+
+  def convertSqlDirectoryToWvlet(opt: SqlToWvletDirOption): Unit =
+    val inDir  = Paths.get(opt.sqlDir)
+    val outDir = Paths.get(opt.outputDir)
+
+    if !Files.exists(inDir) || !Files.isDirectory(inDir) then
+      throw StatusCode.INVALID_ARGUMENT.newException(s"Invalid --sql-dir: ${opt.sqlDir}")
+
+    Files.createDirectories(outDir)
+
+    val matcher = inDir.getFileSystem.getPathMatcher(s"glob:${opt.pattern}")
+
+    val allFiles =
+      Control.withResource(Files.walk(inDir)) { stream =>
+        stream
+          .iterator()
+          .asScala
+          .filter(p => Files.isRegularFile(p))
+          .filter(p => matcher.matches(p.getFileName))
+          .toVector
+          .sortBy(_.toString)
+      }
+
+    val sliced =
+      val dropped = if opt.offset > 0 then allFiles.drop(opt.offset) else allFiles
+      opt.limit match
+        case Some(n) => dropped.take(n)
+        case None    => dropped
+
+    var converted = 0
+    var skipped   = 0
+    var failed    = 0
+
+    info(s"Converting ${sliced.size} SQL files from ${inDir} -> ${outDir} (parseOnly=${opt.parseOnly})")
+
+    sliced.foreach { sqlPath =>
+      val baseName = sqlPath.getFileName.toString
+      val stem     = if baseName.toLowerCase.endsWith(".sql") then baseName.dropRight(4) else baseName
+      val outName  = s"${stem}${opt.suffix}.wv"
+      val outPath  = outDir.resolve(outName)
+
+      if Files.exists(outPath) && !opt.overwrite then
+        skipped += 1
+      else
+        try
+          val wvlet = generateWvletFromSqlFilePath(sqlPath.toString, parseOnly = opt.parseOnly)
+          Files.writeString(outPath, wvlet + "\n", StandardCharsets.UTF_8)
+          converted += 1
+        catch
+          case e: Throwable =>
+            failed += 1
+            warn(s"Failed to convert ${sqlPath}: ${e.getMessage}")
+            if !opt.continueOnError then
+              throw e
+    }
+
+    info(s"Done. converted=${converted}, skipped=${skipped}, failed=${failed}")
 
   def run(): Unit =
     val compiler = createCompiler()
@@ -291,8 +399,22 @@ class WvletCompiler(
 
     val result = PatternExtractor.analyze(logicalPlan, extractorConfig)
 
-    if patternOption.apply then
-      applyAndOutputRefactoring(logicalPlan, result, patternOption, ctx)
+    val effectiveOption: PatternAnalysisOption =
+      // In file-path mode, support --output-dir as a convenience. (Historically, --output-dir
+      // was documented as multi-file mode, but it's useful here too.)
+      if patternOption.apply && patternOption.output.isEmpty && patternOption.outputDir.isDefined then
+        val inputName = Paths.get(resolvedPath).getFileName.toString
+        val baseName  = inputName.stripSuffix(".wv")
+        val outName =
+          if patternOption.overwrite then s"${baseName}.wv"
+          else s"${baseName}${patternOption.suffix}.wv"
+        val outPath = Paths.get(patternOption.outputDir.get).resolve(outName).toString
+        patternOption.copy(output = Some(outPath))
+      else
+        patternOption
+
+    if effectiveOption.apply then
+      applyAndOutputRefactoring(logicalPlan, result, effectiveOption, ctx)
     else
       val output = if patternOption.json then
         formatJsonResult(result, 1)

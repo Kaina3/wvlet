@@ -262,35 +262,75 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
               )
         }
       case j: Join =>
-        val left  = relation(j.left)
-        val right = relation(j.right)(using InFromClause)
+        // If this is a left-deep join chain (often produced from parenthesized SQL joins),
+        // render it as a flat sequence of join clauses.
+        case class JoinItem(joinType: JoinType, right: Relation, cond: JoinCriteria, asof: Boolean)
 
-        val asof: Option[Doc] =
-          if j.asof then
-            Some(text("asof") + ws)
+        def stripJoinBraces(r: Relation): Relation =
+          r match
+            case b: BracedRelation if b.child.isInstanceOf[Join] =>
+              stripJoinBraces(b.child)
+            case other =>
+              other
+
+        def collectLeftDeepJoinChain(rel: Relation): Option[(Relation, List[JoinItem])] =
+          val items = scala.collection.mutable.ListBuffer.empty[JoinItem]
+          var cur: Relation = stripJoinBraces(rel)
+
+          var joinType0: Option[JoinType] = None
+          var asof0: Option[Boolean]      = None
+
+          while cur.isInstanceOf[Join] do
+            val j0 = cur.asInstanceOf[Join]
+
+            // Do not try to flatten implicit joins (comma separated), as they are rendered differently.
+            if j0.joinType == JoinType.ImplicitJoin then
+              return None
+
+            joinType0 match
+              case None =>
+                joinType0 = Some(j0.joinType)
+              case Some(t) =>
+                if t != j0.joinType then
+                  return None
+
+            asof0 match
+              case None =>
+                asof0 = Some(j0.asof)
+              case Some(a) =>
+                if a != j0.asof then
+                  return None
+
+            items.prepend(JoinItem(j0.joinType, j0.right, j0.cond, j0.asof))
+            cur = stripJoinBraces(j0.left)
+
+          // Require at least two joins to justify special formatting.
+          if items.size >= 2 then
+            Some((cur, items.toList))
           else
             None
 
-        val joinType =
-          j.joinType match
+        def joinKeyword(joinType: JoinType, asof: Boolean): Doc =
+          val asofDoc: Option[Doc] = if asof then Some(text("asof") + ws) else None
+          joinType match
             case JoinType.InnerJoin =>
-              wsOrNL + asof + text("join")
+              empty + asofDoc + text("join")
             case JoinType.LeftOuterJoin =>
-              wsOrNL + asof + text("left join")
+              empty + asofDoc + text("left join")
             case JoinType.RightOuterJoin =>
-              wsOrNL + asof + text("right join")
+              empty + asofDoc + text("right join")
             case JoinType.FullOuterJoin =>
-              wsOrNL + asof + text("full join")
+              empty + asofDoc + text("full join")
             case JoinType.CrossJoin =>
-              wsOrNL + asof + text("cross join")
+              empty + asofDoc + text("cross join")
             case JoinType.ImplicitJoin =>
               text(",")
 
-        val cond =
-          j.cond match
+        def joinCond(cond: JoinCriteria): Option[Doc] =
+          cond match
             case NoJoinCriteria =>
               None
-            case n: NaturalJoin =>
+            case _: NaturalJoin =>
               None
             case u: JoinOnTheSameColumns =>
               if u.columns.size == 1 then
@@ -302,9 +342,50 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
             case u: JoinOnEq =>
               Some(wl("on", expr(Expression.concatWithEq(u.keys))))
 
-        code(j) {
-          group(left + joinType + ws + right + nest(wsOrNL + cond))
-        }
+        collectLeftDeepJoinChain(j) match
+          case Some((base, joinItems)) =>
+            val baseDoc = relation(base)
+            val joinLines = joinItems.map { it =>
+              val rightDoc = relation(it.right)(using InFromClause)
+              val condDoc  = joinCond(it.cond)
+              group(joinKeyword(it.joinType, it.asof) + ws + rightDoc + nest(wsOrNL + condDoc))
+            }
+
+            code(j) {
+              joinLines.foldLeft(baseDoc) { (acc, ln) =>
+                acc / ln
+              }
+            }
+          case None =>
+            val left  = relation(j.left)
+            val right = relation(j.right)(using InFromClause)
+
+            val asof: Option[Doc] =
+              if j.asof then
+                Some(text("asof") + ws)
+              else
+                None
+
+            val joinType =
+              j.joinType match
+                case JoinType.InnerJoin =>
+                  wsOrNL + asof + text("join")
+                case JoinType.LeftOuterJoin =>
+                  wsOrNL + asof + text("left join")
+                case JoinType.RightOuterJoin =>
+                  wsOrNL + asof + text("right join")
+                case JoinType.FullOuterJoin =>
+                  wsOrNL + asof + text("full join")
+                case JoinType.CrossJoin =>
+                  wsOrNL + asof + text("cross join")
+                case JoinType.ImplicitJoin =>
+                  text(",")
+
+            val cond = joinCond(j.cond)
+
+            code(j) {
+              group(left + joinType + ws + right + nest(wsOrNL + cond))
+            }
       case u: Union if u.isDistinct =>
         // union is not supported in Wvlet, so rewrite it to dedup(concat)
         code(u) {
@@ -374,9 +455,15 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
       case v: Values =>
         values(v)
       case b: BracedRelation =>
-        code(b) {
-          codeBlock(relation(b.child)(using InSubQuery))
-        }
+        // Parenthesized SQL joins may appear as BracedRelation(Join(...)) in parse-only mode.
+        // Prefer rendering the join itself (without introducing extra `{}` nesting).
+        b.child match
+          case _: Join =>
+            relation(b.child)
+          case _ =>
+            code(b) {
+              codeBlock(relation(b.child)(using InSubQuery))
+            }
       case p: Pivot =>
         val prev      = relation(p.child)
         val pivotKeys = p.pivotKeys.map(expr)

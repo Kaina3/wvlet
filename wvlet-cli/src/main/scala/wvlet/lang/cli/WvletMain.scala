@@ -94,6 +94,13 @@ class WvletMain(opts: WvletGlobalOption) extends LogSupport:
     }
   }
 
+  @command(description = "Convert SQL files in a directory to .wv files")
+  def to_wvlet_dir(compilerOption: WvletCompilerOption, opt: SqlToWvletDirOption): Unit = handleError {
+    withCompiler(compilerOption) { compiler =>
+      compiler.convertSqlDirectoryToWvlet(opt)
+    }
+  }
+
   @command(description = "Analyze query for refactoring opportunities")
   def analyze_patterns(compilerOption: WvletCompilerOption, patternOption: PatternAnalysisOption): Unit = handleError {
     withCompiler(compilerOption) { compiler =>

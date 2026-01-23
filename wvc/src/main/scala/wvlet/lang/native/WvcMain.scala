@@ -8,6 +8,8 @@ import wvlet.lang.compiler.Compiler
 import wvlet.lang.compiler.CompilerOptions
 import wvlet.lang.compiler.Symbol
 import wvlet.lang.compiler.WorkEnv
+import wvlet.lang.compiler.transform.JoinFlattener
+import wvlet.lang.compiler.transform.RewriteExpr
 import wvlet.log.LogLevel
 import wvlet.log.LogSupport
 import wvlet.log.Logger
@@ -273,8 +275,11 @@ object WvcMain extends LogSupport:
               .withDebugRun(false)
               .newContext(Symbol.NoSymbol)
 
-            // Get the resolved logical plan
-            val logicalPlan = inputUnit.resolvedPlan
+            // Get the resolved logical plan and apply join flattening
+            val logicalPlan =
+              val unresolved = inputUnit.resolvedPlan
+              val rewritten  = RewriteExpr.rewriteOnly(unresolved)
+              JoinFlattener.rewriteOnly(rewritten)
 
             // Generate Wvlet code
             val config    = CodeFormatterConfig(sqlDBType = ctx.dbType)
