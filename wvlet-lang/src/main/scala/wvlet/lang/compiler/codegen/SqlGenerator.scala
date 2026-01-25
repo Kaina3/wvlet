@@ -585,17 +585,23 @@ class SqlGenerator(config: CodeFormatterConfig)(using ctx: Context = Context.NoC
         val sql = selectAll(joinSQL, block)
         sql
       case s: SetOperation =>
+        // Process children with InStatement context to avoid redundant parentheses
+        // Each child of a SetOperation should not add extra parentheses internally
         val rels: List[Doc] =
           s.children.toList match
             case Nil =>
               Nil
             case head :: tail =>
-              val hd = query(head, SQLBlock())(using sc)
-              val tl = tail.map(x => query(x, SQLBlock())(using sc))
+              val hd = query(head, SQLBlock())(using InStatement)
+              val tl = tail.map(x => query(x, SQLBlock())(using InStatement))
               hd :: tl
         val op  = text(s.toSQLOp)
         val sql = verticalAppend(rels, op)
-        selectExpr(sql)
+        // Only wrap with parentheses if the outer context requires it (e.g., in a subquery)
+        if sc.isNested && !sc.inFromClause then
+          indentedParen(sql)
+        else
+          sql
       case p: Pivot => // pivot without explicit aggregations
         selectExpr(
           group(
