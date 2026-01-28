@@ -96,7 +96,14 @@ object PathRewriter extends LogSupport:
       case s: Sort =>
         s.copy(child = newChildren.head.asInstanceOf[Relation])
       case d: Distinct =>
-        d.copy(child = newChildren.head.asInstanceOf[Project])
+        // Distinct.child is typed as Project, but after refactoring it may be ModelScan or other Relation
+        // We need to handle this case safely
+        newChildren.head match
+          case p: Project => d.copy(child = p)
+          case r: Relation =>
+            // Wrap non-Project relation in a Project to maintain type safety
+            val wrappedProject = Project(r, Nil, r.span)
+            d.copy(child = wrappedProject)
       case l: Limit =>
         l.copy(child = newChildren.head.asInstanceOf[Relation])
       case o: Offset =>

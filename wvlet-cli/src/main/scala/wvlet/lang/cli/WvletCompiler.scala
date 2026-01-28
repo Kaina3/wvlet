@@ -1,6 +1,7 @@
 package wvlet.lang.cli
 
 import wvlet.airframe.control.Control
+import wvlet.airframe.codec.MessageCodec
 import wvlet.airframe.launcher.argument
 import wvlet.airframe.launcher.option
 import wvlet.lang.api.StatusCode
@@ -18,6 +19,7 @@ import wvlet.lang.compiler.DBType
 import wvlet.lang.compiler.Phase
 import wvlet.lang.compiler.Symbol
 import wvlet.lang.compiler.WorkEnv
+import wvlet.lang.compiler.analyzer.ReadabilityMetrics
 import wvlet.lang.compiler.analyzer.refactor.*
 import wvlet.lang.compiler.transform.JoinFlattener
 import wvlet.lang.compiler.transform.RewriteExpr
@@ -31,12 +33,13 @@ import wvlet.log.LogSupport
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, Paths}
+import java.io.{FileWriter, PrintWriter}
 import scala.jdk.CollectionConverters.*
 
 case class WvletCompilerOption(
     @option(prefix = "-w", description = "Working folder")
     workFolder: String = ".",
-    @option(prefix = "-f,--file", description = "Read a query from the given .wv file")
+    @option(prefix = "-f,--file", description = "Read a query from the given file (.wv or .sql)")
     file: Option[String] = None,
     @argument(description = "query")
     query: Option[String] = None,
@@ -124,6 +127,28 @@ case class SqlToWvletDirOption(
     parseOnly: Boolean = true,
     @option(prefix = "--continue-on-error", description = "Continue converting other files when an error occurs")
     continueOnError: Boolean = true
+)
+
+/**
+  * Options for exporting readability metrics (SN/PR/JI) for a directory of .sql/.wv files
+  */
+case class ReadabilityMetricsDirOption(
+    @option(prefix = "--dir", description = "Directory of query files (.sql or .wv)")
+    dir: String,
+    @option(prefix = "--pattern", description = "File pattern to match (default: *.sql)")
+    pattern: String = "*.sql",
+    @option(prefix = "--offset", description = "Skip first N files (for batch processing)")
+    offset: Int = 0,
+    @option(prefix = "--limit", description = "Limit number of files to process")
+    limit: Option[Int] = None,
+    @option(prefix = "--out", description = "Output jsonl file path")
+    out: String,
+    @option(prefix = "--parse-only", description = "Parse-only mode for faster bulk processing")
+    parseOnly: Boolean = true,
+    @option(prefix = "--continue-on-error", description = "Continue processing other files when an error occurs")
+    continueOnError: Boolean = true,
+    @option(prefix = "--language", description = "Optional language label to emit in output")
+    language: Option[String] = None
 )
 
 class WvletCompiler(
@@ -259,7 +284,7 @@ class WvletCompiler(
 
   def showLogicalPlan: String =
     val inputUnit = getInputUnit(forSQL = false)
-    val ctx       = compileInternal(inputUnit)
+    val ctx       = compileInternal(inputUnit, parseOnly = inputUnit.sourceFile.isSQL)
     
     // Get the resolved logical plan from the compilation unit
     val logicalPlan = inputUnit.resolvedPlan
@@ -267,6 +292,28 @@ class WvletCompiler(
     // Use LogicalPlanPrinter to generate a string representation of the logical plan
     import wvlet.lang.model.plan.LogicalPlanPrinter
     LogicalPlanPrinter.print(logicalPlan)(using ctx)
+
+  def showReadabilityMetrics: ReadabilityMetrics.Metrics =
+    val inputUnit = getInputUnit(forSQL = false)
+    val ctx       = compileInternal(inputUnit, parseOnly = inputUnit.sourceFile.isSQL)
+
+    val plan =
+      val unresolved = inputUnit.resolvedPlan
+      val rewritten  = RewriteExpr.rewriteOnly(unresolved)
+      JoinFlattener.rewriteOnly(rewritten)
+
+    ReadabilityMetrics.compute(plan)
+
+  def showDRYDebug(topK: Int = 10): ReadabilityMetrics.DryDebug =
+    val inputUnit = getInputUnit(forSQL = false)
+    val ctx       = compileInternal(inputUnit, parseOnly = inputUnit.sourceFile.isSQL)
+
+    val plan =
+      val unresolved = inputUnit.resolvedPlan
+      val rewritten  = RewriteExpr.rewriteOnly(unresolved)
+      JoinFlattener.rewriteOnly(rewritten)
+
+    ReadabilityMetrics.computeDRYDebug(plan, topK = topK)
 
   private def generateWvletFromSqlFilePath(sqlFilePath: String, parseOnly: Boolean): String =
     val inputUnit = CompilationUnit.fromFile(sqlFilePath)
@@ -340,6 +387,137 @@ class WvletCompiler(
     }
 
     info(s"Done. converted=${converted}, skipped=${skipped}, failed=${failed}")
+
+  case class ReadabilityMetricRecord(
+      query_id: String,
+      DRY: Double,
+      SN: Double,
+      PR: Double,
+      JI: Double,
+      parse_ok: Boolean,
+      error: Option[String] = None,
+      language: Option[String] = None
+  )
+
+  private def extractQueryIdFromFileName(fileName: String): String =
+    val stem =
+      if fileName.toLowerCase.endsWith(".sql") then fileName.dropRight(4)
+      else if fileName.toLowerCase.endsWith(".wv") then fileName.dropRight(3)
+      else fileName
+    stem.stripPrefix("query_").stripSuffix("_refactored")
+
+  def exportReadabilityMetrics(opt: ReadabilityMetricsDirOption): Unit =
+    val inDir = Paths.get(opt.dir)
+    if !Files.exists(inDir) || !Files.isDirectory(inDir) then
+      throw StatusCode.INVALID_ARGUMENT.newException(s"Invalid --dir: ${opt.dir}")
+
+    val matcher = inDir.getFileSystem.getPathMatcher(s"glob:${opt.pattern}")
+
+    val allFiles =
+      Control.withResource(Files.walk(inDir)) { stream =>
+        stream
+          .iterator()
+          .asScala
+          .filter(p => Files.isRegularFile(p))
+          .filter(p => matcher.matches(p.getFileName))
+          .toVector
+          .sortBy(_.toString)
+      }
+
+    val sliced =
+      val dropped = if opt.offset > 0 then allFiles.drop(opt.offset) else allFiles
+      opt.limit match
+        case Some(n) => dropped.take(n)
+        case None    => dropped
+
+    val outPath = Paths.get(opt.out)
+    Option(outPath.getParent).foreach(p => Files.createDirectories(p))
+
+    info(s"Exporting readability metrics for ${sliced.size} files from ${inDir} -> ${outPath} (parseOnly=${opt.parseOnly})")
+
+    val codec = MessageCodec.of[ReadabilityMetricRecord]
+
+    // IMPORTANT: Don't set sourceFolders to inDir. If inDir contains non-query artifacts
+    // (e.g., files starting with "SyntaxError%"), the compiler may pick them up and fail
+    // even when compiling a specific file.
+    // Use the workFolder-based setup (same as single-file commands) and compile each unit by path.
+    val compiler = createCompiler(parseOnly = opt.parseOnly, sourceFolders = List(compilerOption.workFolder))
+
+    var processed = 0
+    var failed = 0
+    val total = sliced.size
+    val progressInterval = Math.max(1, total / 100) // Log every 1%
+
+    Control.withResource(new PrintWriter(new FileWriter(outPath.toString))) { writer =>
+      sliced.foreach { filePath =>
+        processed += 1
+        val fileName = filePath.getFileName.toString
+        val queryId = extractQueryIdFromFileName(fileName)
+
+        // Progress logging
+        if processed % progressInterval == 0 || processed == total then
+          val pct = (processed * 100.0 / total).toInt
+          info(s"Progress: ${processed}/${total} (${pct}%) failed=${failed}")
+
+        try
+          val unit = CompilationUnit.fromFile(filePath.toString)
+          val result = compiler.compileSingleUnit(unit)
+
+          if result.hasFailures then
+            failed += 1
+            val msg = result.failureReport.map(_._2.getMessage).mkString("; ")
+            // Ensure jsonl is truly one-record-per-line (avoid raw newlines/tabs in error strings)
+            val msg1 = msg.replaceAll("\\s+", " ").trim
+            val rec = ReadabilityMetricRecord(
+              query_id = queryId,
+              DRY = 0.0,
+              SN = 0.0,
+              PR = 0.5,
+              JI = 1.0,
+              parse_ok = false,
+              error = Some(msg1.take(500)),
+              language = opt.language
+            )
+            writer.println(codec.toJson(rec))
+            if !opt.continueOnError then
+              throw StatusCode.INTERNAL_ERROR.newException(msg)
+          else
+            val unresolved = unit.resolvedPlan
+            val rewritten  = RewriteExpr.rewriteOnly(unresolved)
+            val plan       = JoinFlattener.rewriteOnly(rewritten)
+            val m          = ReadabilityMetrics.compute(plan)
+            val rec = ReadabilityMetricRecord(
+              query_id = queryId,
+              DRY = m.DRY,
+              SN = m.SN,
+              PR = m.PR,
+              JI = m.JI,
+              parse_ok = true,
+              error = None,
+              language = opt.language
+            )
+            writer.println(codec.toJson(rec))
+        catch
+          case e: Throwable =>
+            failed += 1
+            val msg1 = Option(e.getMessage).getOrElse(e.getClass.getSimpleName).replaceAll("\\s+", " ").trim
+            val rec = ReadabilityMetricRecord(
+              query_id = queryId,
+              DRY = 0.0,
+              SN = 0.0,
+              PR = 0.5,
+              JI = 1.0,
+              parse_ok = false,
+              error = Some(msg1.take(500)),
+              language = opt.language
+            )
+            writer.println(codec.toJson(rec))
+            if !opt.continueOnError then
+              throw e
+      }
+    }
+
+    info(s"Done. processed=${processed}, failed=${failed}")
 
   def run(): Unit =
     val compiler = createCompiler()

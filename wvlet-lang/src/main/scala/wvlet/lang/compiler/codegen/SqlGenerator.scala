@@ -393,6 +393,74 @@ class SqlGenerator(config: CodeFormatterConfig)(using ctx: Context = Context.NoC
         unsupportedNode(s"Update ${u.nodeName}", u.span)
 
   /**
+    * Generate a flat JOIN chain SQL without wrapping each join in select * from.
+    * This walks the left spine of the join tree, collecting all joins, then generates
+    * a flat: t1 join t2 on ... join t3 on ... structure.
+    */
+  private def flatJoinChain(j: Join)(using sc: SyntaxContext): Doc =
+    // Collect all joins in left-deep order: [(relation, joinType, condition)]
+    // The result is: [leftmost_table, (t2, join_type1, cond1), (t3, join_type2, cond2), ...]
+    def collectJoins(rel: Relation): (Relation, List[(Relation, Join)]) =
+      rel match
+        case join: Join =>
+          val (leftmost, joins) = collectJoins(join.left)
+          (leftmost, joins :+ (join.right, join))
+        case other =>
+          (other, Nil)
+
+    val (leftmost, joinParts) = collectJoins(j)
+
+    // Generate the leftmost table (not a join)
+    val leftDoc = relation(leftmost, SQLBlock())(using InFromClause)
+
+    // Generate each join part
+    val joinDocs = joinParts.map { case (rightRel, join) =>
+      val asof: Option[Doc] =
+        if join.asof then
+          if dbType.supportAsOfJoin then
+            Some(text("asof") + ws)
+          else
+            syntaxError(s"AsOf join is not supported in ${dbType}")
+        else
+          None
+
+      val joinTypeDoc: Doc =
+        join.joinType match
+          case InnerJoin =>
+            wsOrNL + asof + text("join")
+          case LeftOuterJoin =>
+            wsOrNL + asof + text("left join")
+          case RightOuterJoin =>
+            wsOrNL + asof + text("right join")
+          case FullOuterJoin =>
+            wsOrNL + asof + text("full outer join")
+          case CrossJoin =>
+            wsOrNL + asof + text("cross join")
+          case ImplicitJoin =>
+            text(",")
+
+      val rightDoc = relation(rightRel, SQLBlock())(using InFromClause)
+
+      val condDoc: Option[Doc] =
+        join.cond match
+          case NoJoinCriteria =>
+            None
+          case NaturalJoin(_) =>
+            None
+          case u: JoinOnTheSameColumns =>
+            Some(wsOrNL + text("using") + ws + paren(cl(u.columns.map(expr))))
+          case JoinOn(e, _) =>
+            Some(wsOrNL + wl("on", expr(e)))
+          case JoinOnEq(keys, _) =>
+            Some(wsOrNL + wl("on", expr(Expression.concatWithEq(keys))))
+
+      joinTypeDoc + ws + rightDoc + condDoc
+    }
+
+    // Combine: leftDoc join t2 on ... join t3 on ...
+    group(leftDoc + joinDocs.foldLeft(empty)(_ + _))
+
+  /**
     * Print Relation nodes while tracking the parent nodes (e.g., filter, sort) for merging them
     * later into a single SELECT statement.
     * @param r
@@ -537,51 +605,17 @@ class SqlGenerator(config: CodeFormatterConfig)(using ctx: Context = Context.NoC
             selectExpr(inner)
           case AliasedRelation(v: Values, _, _, _) =>
             selectExpr(inner)
+          case _: Join =>
+            // For braced joins, just process the join without extra wrapping
+            // This avoids generating: select * from (select * from t1 join t2 ...)
+            relation(p.child, block)
           case _ =>
             val body = query(p.child, SQLBlock())(using InSubQuery)
             selectExpr(body)
       case j: Join =>
-        val asof: Option[Doc] =
-          if j.asof then
-            if dbType.supportAsOfJoin then
-              Some(text("asof") + ws)
-            else
-              syntaxError(s"AsOf join is not supported in ${dbType}")
-          else
-            None
-
-        val joinType: Doc =
-          j.joinType match
-            case InnerJoin =>
-              wsOrNL + asof + text("join")
-            case LeftOuterJoin =>
-              wsOrNL + asof + text("left join")
-            case RightOuterJoin =>
-              wsOrNL + asof + text("right join")
-            case FullOuterJoin =>
-              wsOrNL + asof + text("full outer join")
-            case CrossJoin =>
-              wsOrNL + asof + text("cross join")
-            case ImplicitJoin =>
-              text(",")
-
-        // Generate SQL for left and right relations in a flat structure
-        val l              = relation(j.left, SQLBlock())(using InFromClause)
-        val r              = relation(j.right, SQLBlock())(using InFromClause)
-        val c: Option[Doc] =
-          j.cond match
-            case NoJoinCriteria =>
-              None
-            case NaturalJoin(_) =>
-              None
-            case u: JoinOnTheSameColumns =>
-              Some(wsOrNL + text("using") + ws + paren(cl(u.columns.map(expr))))
-            case JoinOn(e, _) =>
-              Some(wsOrNL + wl("on", expr(e)))
-            case JoinOnEq(keys, _) =>
-              Some(wsOrNL + wl("on", expr(Expression.concatWithEq(keys))))
-        val joinSQL: Doc = group(l + joinType + ws + r + c)
-        // Append select * from (left) join (right) where ...
+        // Generate flat join chain without wrapping each join in select * from
+        val joinSQL: Doc = flatJoinChain(j)
+        // Only wrap with select * from at the top level if needed
         val sql = selectAll(joinSQL, block)
         sql
       case s: SetOperation =>

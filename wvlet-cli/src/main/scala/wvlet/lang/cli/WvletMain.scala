@@ -101,6 +101,36 @@ class WvletMain(opts: WvletGlobalOption) extends LogSupport:
     }
   }
 
+  @command(description = "Export readability metrics (DRY/SN/PR/JI) as jsonl for query files in a directory")
+  def export_readability_metrics(
+      compilerOption: WvletCompilerOption,
+      opt: ReadabilityMetricsDirOption
+  ): Unit = handleError {
+    withCompiler(compilerOption) { compiler =>
+      compiler.exportReadabilityMetrics(opt)
+    }
+  }
+
+  @command(description = "Show readability metrics (DRY/SN/PR/JI) for a query")
+  def show_readability_metrics(compilerOption: WvletCompilerOption): Unit = handleError {
+    withCompiler(compilerOption) { compiler =>
+      val m = compiler.showReadabilityMetrics
+      // Keep output stable and machine-readable without adding new dependencies.
+      println(s"{\"DRY\":${m.DRY},\"SN\":${m.SN},\"PR\":${m.PR},\"JI\":${m.JI}}")
+    }
+  }
+
+  @command(description = "Show DRY debug details (node counts, repeats) for a query")
+  def show_dry_debug(compilerOption: WvletCompilerOption, top_k: Int = 10): Unit = handleError {
+    withCompiler(compilerOption) { compiler =>
+      val d = compiler.showDRYDebug(topK = top_k)
+      val top = d.top_repeated.map { case (k, c) => s"{\"sig\":\"${k}\",\"count\":${c}}" }.mkString("[", ",", "]")
+      println(
+        s"{\"DRY\":${d.DRY},\"total_nodes\":${d.total_nodes},\"duplicate_nodes\":${d.duplicate_nodes},\"distinct_subplans\":${d.distinct_subplans},\"top_repeated\":${top}}"
+      )
+    }
+  }
+
   @command(description = "Analyze query for refactoring opportunities")
   def analyze_patterns(compilerOption: WvletCompilerOption, patternOption: PatternAnalysisOption): Unit = handleError {
     withCompiler(compilerOption) { compiler =>

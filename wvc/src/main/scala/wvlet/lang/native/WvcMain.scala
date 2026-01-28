@@ -10,6 +10,7 @@ import wvlet.lang.compiler.Symbol
 import wvlet.lang.compiler.WorkEnv
 import wvlet.lang.compiler.transform.JoinFlattener
 import wvlet.lang.compiler.transform.RewriteExpr
+import wvlet.lang.model.plan.Relation
 import wvlet.log.LogLevel
 import wvlet.log.LogSupport
 import wvlet.log.Logger
@@ -23,6 +24,11 @@ object WvcMain extends LogSupport:
       val (wvletResult, shouldReturn) = convertSqlToWvlet(args.drop(1))
       if !shouldReturn then
         println(wvletResult)
+    else if args.length > 0 && args(0) == "flatten" then
+      // Call flattenSql for SQL -> Wvlet -> SQL flattening
+      val (sqlResult, shouldReturn) = flattenSql(args.drop(1))
+      if !shouldReturn then
+        println(sqlResult)
     else
       // Call compileWvletQuery to process the query and check if -x flag was set
       val (sqlResult, shouldReturn) = compileWvletQuery(args)
@@ -295,5 +301,169 @@ object WvcMain extends LogSupport:
     result
 
   end convertSqlToWvlet
+
+  /**
+    * Flatten SQL: SQL -> Wvlet -> SQL
+    * Combines to_wvlet and to_sql in one command to avoid subprocess overhead
+    */
+  def flattenSql(args: Array[String]): (String, Boolean) =
+    var inputQuery: Option[String]     = None
+    var workFolder                     = "."
+    var displayHelp                    = false
+    var logLevel: LogLevel             = LogLevel.INFO
+    var logLevelPatterns: List[String] = List.empty[String]
+    var remainingArgs: List[String]    = Nil
+    var parseSuccess: Boolean          = false
+    var returnResult                   = false
+    var copyOnError                    = false  // -c flag: output original SQL on error
+
+    // Option parsing
+    def parseOption(lst: List[String]): Unit =
+      lst match
+        case h :: tail if h == "-h" || h == "--help" =>
+          displayHelp = true
+          parseOption(tail)
+        case "-w" :: folder :: tail =>
+          workFolder = folder
+          parseOption(tail)
+        case "-q" :: query :: tail =>
+          inputQuery = Some(query.toString)
+          parseOption(tail)
+        case "-l" :: level :: tail =>
+          logLevel = LogLevel(level.toString)
+          parseOption(tail)
+        case "-L" :: pattern :: tail =>
+          logLevelPatterns = pattern.toString :: logLevelPatterns
+          parseOption(tail)
+        case "-x" :: tail =>
+          returnResult = true
+          parseOption(tail)
+        case "-c" :: tail =>
+          copyOnError = true
+          parseOption(tail)
+        case h :: tail if h.startsWith("-") || h.startsWith("--") =>
+          warn(s"Unknown option: ${h}")
+          parseSuccess = false
+        case rest =>
+          parseSuccess = true
+          remainingArgs = rest
+
+    parseOption(args.toList)
+
+    val result: (String, Boolean) =
+      if !parseSuccess then
+        System.exit(1)
+        ("", false)
+      else if displayHelp then
+        val helpMessage =
+          """wvc flatten (SQL Flattener)
+            |  Flatten SQL by converting SQL -> Wvlet -> SQL
+            |  This applies join flattening and reformatting
+            |
+            |[usage]:
+            |  wvc flatten [options] -q '(SQL query)'
+            |  wvc flatten [options] '(SQL query)'
+            |  cat query.sql | wvc flatten [options]
+            |
+            |[options]
+            | -h, --help         Display help message
+            | -w <folder>        Working folder
+            | -q <query>         SQL query string
+            | -l <level>         Log level (info, debug, trace, warn, error)
+            | -L <pattern=level> Set log level for a class pattern
+            | -x                 Return the result instead of printing it
+            | -c                 Copy original SQL on error (instead of failing)
+            |""".stripMargin
+        (helpMessage, returnResult)
+      else
+        // Set log levels
+        Logger("wvlet.lang.compiler").setLogLevel(logLevel)
+        Logger("wvlet.lang.runner").setLogLevel(logLevel)
+        Logger("wvlet.lang.native").setLogLevel(logLevel)
+        logLevelPatterns.foreach { p =>
+          p.split("=") match
+            case Array(pattern, level) =>
+              debug(s"Set the log level for ${pattern} to ${level}")
+              Logger.setLogLevel(pattern, LogLevel(level))
+            case _ =>
+              error(s"Invalid log level pattern: ${p}")
+        }
+
+        // Get query from -q option, positional argument, or stdin
+        val query: String =
+          inputQuery match
+            case Some(q) =>
+              q
+            case None =>
+              if remainingArgs.nonEmpty then
+                remainingArgs.mkString(" ")
+              else
+                import scala.scalanative.posix.unistd
+                val connectedToStdin = unistd.isatty(unistd.STDIN_FILENO) == 0
+                if connectedToStdin then
+                  Iterator.continually(scala.io.StdIn.readLine()).takeWhile(_ != null).mkString("\n")
+                else
+                  ""
+
+        if query.trim.isEmpty then
+          warn(s"No SQL query is given. Use -q 'query' option, positional argument, or stdin")
+          ("", returnResult)
+        else
+          try
+            // Step 1: Parse SQL and convert to Wvlet logical plan
+            val compiler = Compiler(
+              CompilerOptions(
+                workEnv = WorkEnv(path = workFolder),
+                sourceFolders = List(workFolder)
+              ),
+              phases = Compiler.parseOnlyPhases
+            )
+
+            val sqlInputUnit  = CompilationUnit.fromSqlString(query)
+            val parseResult   = compiler.compileSingleUnit(sqlInputUnit)
+            parseResult.reportAllErrors
+
+            val parseCtx = parseResult
+              .context
+              .withCompilationUnit(sqlInputUnit)
+              .withDebugRun(false)
+              .newContext(Symbol.NoSymbol)
+
+            // Get the resolved logical plan with join flattening
+            val logicalPlan =
+              val unresolved = sqlInputUnit.resolvedPlan
+              val rewritten  = RewriteExpr.rewriteOnly(unresolved)
+              JoinFlattener.rewriteOnly(rewritten)
+
+            // Check if this is an "execute sql" wrapper (pass-through)
+            val config       = CodeFormatterConfig(sqlDBType = parseCtx.dbType)
+            val wvGenerator  = WvletGenerator(config)(using parseCtx)
+            val wvletCode    = wvGenerator.print(logicalPlan)
+
+            // If Wvlet code contains "execute sql", just return original SQL
+            if wvletCode.toLowerCase.contains("execute sql") then
+              (query, returnResult)
+            else
+              // Step 2: Generate SQL from the flattened logical plan
+              logicalPlan match
+                case r: Relation =>
+                  val generatedSQL = GenSQL.generateSQLFromRelation(r)(using parseCtx)
+                  (generatedSQL.sql, returnResult)
+                case _ =>
+                  // Fallback to original method for non-relation plans
+                  val sql = GenSQL.generateSQL(sqlInputUnit)(using parseCtx)
+                  (sql, returnResult)
+          catch
+            case e: Exception =>
+              if copyOnError then
+                // Return original SQL on error
+                (query, returnResult)
+              else
+                error(s"Error flattening SQL: ${e.getMessage}")
+                ("", returnResult)
+
+    result
+
+  end flattenSql
 
 end WvcMain
