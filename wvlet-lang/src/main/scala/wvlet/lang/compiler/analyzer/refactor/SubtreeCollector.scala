@@ -14,6 +14,7 @@
 package wvlet.lang.compiler.analyzer.refactor
 
 import wvlet.lang.model.plan.*
+import wvlet.lang.model.expr.{Expression, SubQueryExpression}
 import wvlet.log.LogSupport
 
 import scala.collection.mutable.ListBuffer
@@ -182,6 +183,14 @@ object SubtreeCollector extends LogSupport:
       traverse(child, currentDepth + 1, path :+ idx, config, sourceId, result)
     }
 
+    // Also traverse SubQueryExpression's inner queries (e.g., HAVING subqueries)
+    // These are separate logical plans embedded in expressions, not in node.children
+    val subQueryExprs = collectSubQueryExpressions(node)
+    subQueryExprs.zipWithIndex.foreach { case (sq, sqIdx) =>
+      // Use offset 1000 to avoid path collision with regular child indices
+      traverse(sq.query, currentDepth + 1, path :+ (1000 + sqIdx), config, sourceId, result)
+    }
+
     val depth =
       if childResults.isEmpty then 1
       else childResults.map(_._1).max + 1
@@ -305,5 +314,17 @@ object SubtreeCollector extends LogSupport:
     debug(s"  - Average node count: ${subtrees.map(_.nodeCount).sum.toDouble / subtrees.size}")
     debug(s"  - Unique hashes: ${subtrees.map(_.structuralHash).distinct.size}")
     debug(s"  - Sources: ${subtrees.flatMap(_.sourceId).distinct.size}")
+
+  /**
+    * Collect SubQueryExpression instances from a LogicalPlan node's expressions.
+    * This finds subqueries embedded in expressions (e.g., HAVING clause subqueries)
+    * that are not reachable via node.children.
+    */
+  private def collectSubQueryExpressions(node: LogicalPlan): List[SubQueryExpression] =
+    def findInExpr(expr: Expression): List[SubQueryExpression] =
+      expr match
+        case sq: SubQueryExpression => sq :: Nil
+        case _ => expr.children.flatMap(findInExpr).toList
+    node.childExpressions.flatMap(findInExpr).toList
 
 end SubtreeCollector

@@ -8,8 +8,10 @@ import wvlet.lang.compiler.Compiler
 import wvlet.lang.compiler.CompilerOptions
 import wvlet.lang.compiler.Symbol
 import wvlet.lang.compiler.WorkEnv
+import wvlet.lang.compiler.transform.ImplicitJoinRewriter
 import wvlet.lang.compiler.transform.JoinFlattener
 import wvlet.lang.compiler.transform.RewriteExpr
+import wvlet.lang.compiler.analyzer.refactor.*
 import wvlet.lang.model.plan.Relation
 import wvlet.log.LogLevel
 import wvlet.log.LogSupport
@@ -29,6 +31,11 @@ object WvcMain extends LogSupport:
       val (sqlResult, shouldReturn) = flattenSql(args.drop(1))
       if !shouldReturn then
         println(sqlResult)
+    else if args.length > 0 && args(0) == "refactor" then
+      // Call refactorWvlet for duplicate pattern refactoring
+      val (result, shouldReturn) = refactorWvlet(args.drop(1))
+      if !shouldReturn then
+        println(result)
     else
       // Call compileWvletQuery to process the query and check if -x flag was set
       val (sqlResult, shouldReturn) = compileWvletQuery(args)
@@ -285,7 +292,8 @@ object WvcMain extends LogSupport:
             val logicalPlan =
               val unresolved = inputUnit.resolvedPlan
               val rewritten  = RewriteExpr.rewriteOnly(unresolved)
-              JoinFlattener.rewriteOnly(rewritten)
+              val flattened  = JoinFlattener.rewriteOnly(rewritten)
+              ImplicitJoinRewriter.rewriteOnly(flattened)
 
             // Generate Wvlet code
             val config    = CodeFormatterConfig(sqlDBType = ctx.dbType)
@@ -433,7 +441,8 @@ object WvcMain extends LogSupport:
             val logicalPlan =
               val unresolved = sqlInputUnit.resolvedPlan
               val rewritten  = RewriteExpr.rewriteOnly(unresolved)
-              JoinFlattener.rewriteOnly(rewritten)
+              val flattened  = JoinFlattener.rewriteOnly(rewritten)
+              ImplicitJoinRewriter.rewriteOnly(flattened)
 
             // Check if this is an "execute sql" wrapper (pass-through)
             val config       = CodeFormatterConfig(sqlDBType = parseCtx.dbType)
@@ -465,5 +474,220 @@ object WvcMain extends LogSupport:
     result
 
   end flattenSql
+
+  /**
+    * Refactor Wvlet: detect duplicate patterns and extract them into reusable models
+    */
+  def refactorWvlet(args: Array[String]): (String, Boolean) =
+    var inputQuery: Option[String]     = None
+    var inputFile: Option[String]      = None
+    var workFolder                     = "."
+    var displayHelp                    = false
+    var logLevel: LogLevel             = LogLevel.INFO
+    var logLevelPatterns: List[String] = List.empty[String]
+    var remainingArgs: List[String]    = Nil
+    var parseSuccess: Boolean          = false
+    var returnResult                   = false
+    var aggressive                     = true  // default to aggressive mode
+
+    // Option parsing
+    def parseOption(lst: List[String]): Unit =
+      lst match
+        case h :: tail if h == "-h" || h == "--help" =>
+          displayHelp = true
+          parseOption(tail)
+        case "-w" :: folder :: tail =>
+          workFolder = folder
+          parseOption(tail)
+        case "-q" :: query :: tail =>
+          inputQuery = Some(query.toString)
+          parseOption(tail)
+        case "--file" :: path :: tail =>
+          inputFile = Some(path.toString)
+          parseOption(tail)
+        case "-l" :: level :: tail =>
+          logLevel = LogLevel(level.toString)
+          parseOption(tail)
+        case "-L" :: pattern :: tail =>
+          logLevelPatterns = pattern.toString :: logLevelPatterns
+          parseOption(tail)
+        case "-x" :: tail =>
+          returnResult = true
+          parseOption(tail)
+        case "--no-aggressive" :: tail =>
+          aggressive = false
+          parseOption(tail)
+        case h :: tail if h.startsWith("-") || h.startsWith("--") =>
+          warn(s"Unknown option: ${h}")
+          parseSuccess = false
+        case rest =>
+          parseSuccess = true
+          remainingArgs = rest
+
+    parseOption(args.toList)
+
+    val result: (String, Boolean) =
+      if !parseSuccess then
+        System.exit(1)
+        ("", false)
+      else if displayHelp then
+        val helpMessage =
+          """wvc refactor (Wvlet Pattern Refactoring)
+            |  Detect duplicate patterns in Wvlet code and extract them into reusable models
+            |
+            |[usage]:
+            |  wvc refactor [options] --file <path.wv>
+            |  wvc refactor [options] -q '(Wvlet query)'
+            |  cat query.wv | wvc refactor [options]
+            |
+            |[options]
+            | -h, --help         Display help message
+            | -w <folder>        Working folder
+            | -q <query>         Wvlet query string
+            | --file <path>      Input .wv file path
+            | -l <level>         Log level (info, debug, trace, warn, error)
+            | -L <pattern=level> Set log level for a class pattern
+            | -x                 Return the result instead of printing it
+            | --no-aggressive    Use default (non-aggressive) pattern detection
+            |""".stripMargin
+        (helpMessage, returnResult)
+      else
+        // Set log levels
+        Logger("wvlet.lang.compiler").setLogLevel(logLevel)
+        Logger("wvlet.lang.runner").setLogLevel(logLevel)
+        Logger("wvlet.lang.native").setLogLevel(logLevel)
+        logLevelPatterns.foreach { p =>
+          p.split("=") match
+            case Array(pattern, level) =>
+              debug(s"Set the log level for ${pattern} to ${level}")
+              Logger.setLogLevel(pattern, LogLevel(level))
+            case _ =>
+              error(s"Invalid log level pattern: ${p}")
+        }
+
+        // Get Wvlet input from --file, -q, or stdin
+        val query: String =
+          inputFile match
+            case Some(path) =>
+              // Read file content
+              val source = scala.io.Source.fromFile(path)
+              try source.mkString
+              finally source.close()
+            case None =>
+              inputQuery match
+                case Some(q) =>
+                  q
+                case None =>
+                  if remainingArgs.nonEmpty then
+                    remainingArgs.mkString(" ")
+                  else
+                    import scala.scalanative.posix.unistd
+                    val connectedToStdin = unistd.isatty(unistd.STDIN_FILENO) == 0
+                    if connectedToStdin then
+                      Iterator.continually(scala.io.StdIn.readLine()).takeWhile(_ != null).mkString("\n")
+                    else
+                      ""
+
+        if query.trim.isEmpty then
+          warn(s"No Wvlet query is given. Use --file <path>, -q 'query', or stdin")
+          ("", returnResult)
+        else
+          try
+            // Compile with parseOnly phases
+            val compiler = Compiler(
+              CompilerOptions(
+                workEnv = WorkEnv(path = workFolder),
+                sourceFolders = Nil  // No folder scanning for single-file analysis
+              ),
+              phases = Compiler.parseOnlyPhases
+            )
+
+            val inputUnit     = CompilationUnit.fromWvletString(query)
+            val compileResult = compiler.compileSingleUnit(inputUnit)
+            compileResult.reportAllErrors
+
+            val ctx = compileResult
+              .context
+              .withCompilationUnit(inputUnit)
+              .withDebugRun(false)
+              .newContext(Symbol.NoSymbol)
+
+            val logicalPlan = inputUnit.resolvedPlan
+
+            // Build extractor config
+            val refactorConfig =
+              if aggressive then RefactorConfig.aggressive
+              else RefactorConfig.default
+
+            val collectorConfig =
+              if aggressive then CollectorConfig(minDepth = 1, minNodeCount = 2)
+              else CollectorConfig.default
+
+            val detectorConfig =
+              if aggressive then DetectorConfig.aggressive
+              else DetectorConfig.default
+
+            val extractorConfig = PatternExtractorConfig(
+              enabled = true,
+              refactorConfig = refactorConfig,
+              collectorConfig = collectorConfig,
+              detectorConfig = detectorConfig,
+              maxSuggestions = Int.MaxValue,
+              crossQueryAnalysis = false
+            )
+
+            // Run pattern extraction
+            val extraction = PatternExtractor.analyze(logicalPlan, extractorConfig)
+
+            // Apply refactorings
+            val applyConfig = ApplyConfig(
+              topK = 0,
+              useOptimalSuggestions = true,
+              usePerFileSelection = true,
+              modelNamePrefix = "auto",
+              skipIfOverlaps = true,
+              requireVariableParams = false
+            )
+
+            val applyResult = RefactoringApplier.applyRefactorings(logicalPlan, extraction, applyConfig)
+
+            // Generate Wvlet code
+            val config    = CodeFormatterConfig(sqlDBType = ctx.dbType)
+            val generator = WvletGenerator(config)(using ctx)
+
+            if !applyResult.hasChanges then
+              // No refactorings found, output original code
+              val output = generator.print(logicalPlan)
+              (output, returnResult)
+            else
+              val output = generator.print(applyResult.updatedPlan)
+
+              // Add header comment with refactoring summary (using -- for Wvlet comments)
+              val header = new StringBuilder
+              header.append(s"-- Auto-refactored by Wvlet Pattern Analyzer\n")
+              header.append(s"-- Applied ${applyResult.applied.size} refactoring(s)\n")
+              header.append(s"-- Total occurrences replaced: ${applyResult.totalOccurrencesReplaced}\n")
+              header.append(s"-- Estimated node reduction: ${applyResult.totalNodeReduction}\n")
+              header.append("--\n")
+              applyResult.applied.foreach { applied =>
+                header.append(s"-- - ${applied.suggestionId}: ${applied.occurrencesReplaced} occurrences\n")
+              }
+              if applyResult.skipped.nonEmpty then
+                header.append("-- Skipped:\n")
+                applyResult.skipped.foreach { skipped =>
+                  header.append(s"--   - ${skipped.suggestionId}: ${skipped.reason}\n")
+                }
+              header.append("\n")
+
+              val fullOutput = header.toString + output
+              (fullOutput, returnResult)
+          catch
+            case e: Exception =>
+              error(s"Error refactoring Wvlet: ${e.getMessage}")
+              ("", returnResult)
+
+    result
+
+  end refactorWvlet
 
 end WvcMain

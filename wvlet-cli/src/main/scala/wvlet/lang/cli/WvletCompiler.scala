@@ -21,6 +21,7 @@ import wvlet.lang.compiler.Symbol
 import wvlet.lang.compiler.WorkEnv
 import wvlet.lang.compiler.analyzer.ReadabilityMetrics
 import wvlet.lang.compiler.analyzer.refactor.*
+import wvlet.lang.compiler.transform.ImplicitJoinRewriter
 import wvlet.lang.compiler.transform.JoinFlattener
 import wvlet.lang.compiler.transform.RewriteExpr
 import wvlet.lang.model.plan.LogicalPlan
@@ -273,7 +274,8 @@ class WvletCompiler(
     val logicalPlan =
       val unresolved = inputUnit.resolvedPlan
       val rewritten  = RewriteExpr.rewriteOnly(unresolved)
-      JoinFlattener.rewriteOnly(rewritten)
+      val flattened  = JoinFlattener.rewriteOnly(rewritten)
+      ImplicitJoinRewriter.rewriteOnly(flattened)
 
     // Create a WvletGenerator with the appropriate database type configuration
     val config    = CodeFormatterConfig(sqlDBType = ctx.dbType)
@@ -300,7 +302,8 @@ class WvletCompiler(
     val plan =
       val unresolved = inputUnit.resolvedPlan
       val rewritten  = RewriteExpr.rewriteOnly(unresolved)
-      JoinFlattener.rewriteOnly(rewritten)
+      val flattened  = JoinFlattener.rewriteOnly(rewritten)
+      ImplicitJoinRewriter.rewriteOnly(flattened)
 
     ReadabilityMetrics.compute(plan)
 
@@ -311,7 +314,8 @@ class WvletCompiler(
     val plan =
       val unresolved = inputUnit.resolvedPlan
       val rewritten  = RewriteExpr.rewriteOnly(unresolved)
-      JoinFlattener.rewriteOnly(rewritten)
+      val flattened  = JoinFlattener.rewriteOnly(rewritten)
+      ImplicitJoinRewriter.rewriteOnly(flattened)
 
     ReadabilityMetrics.computeDRYDebug(plan, topK = topK)
 
@@ -326,7 +330,8 @@ class WvletCompiler(
     val logicalPlan =
       val unresolved = inputUnit.resolvedPlan
       val rewritten  = RewriteExpr.rewriteOnly(unresolved)
-      JoinFlattener.rewriteOnly(rewritten)
+      val flattened  = JoinFlattener.rewriteOnly(rewritten)
+      ImplicitJoinRewriter.rewriteOnly(flattened)
     val config      = CodeFormatterConfig(sqlDBType = ctx.dbType)
     val generator   = WvletGenerator(config)(using ctx)
     generator.print(logicalPlan)
@@ -484,7 +489,8 @@ class WvletCompiler(
           else
             val unresolved = unit.resolvedPlan
             val rewritten  = RewriteExpr.rewriteOnly(unresolved)
-            val plan       = JoinFlattener.rewriteOnly(rewritten)
+            val flattened  = JoinFlattener.rewriteOnly(rewritten)
+            val plan       = ImplicitJoinRewriter.rewriteOnly(flattened)
             val m          = ReadabilityMetrics.compute(plan)
             val rec = ReadabilityMetricRecord(
               query_id = queryId,

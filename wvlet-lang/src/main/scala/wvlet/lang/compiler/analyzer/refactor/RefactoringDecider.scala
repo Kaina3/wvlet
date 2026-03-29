@@ -473,13 +473,11 @@ object RefactoringDecider extends LogSupport:
     if suggestions.isEmpty then
       return Nil
 
-    // Filter by variable params (same as --apply)
-    val filtered = suggestions.filter { s =>
-      s.unifyResult.exists(_.variableParameters.nonEmpty)
-    }
+    // Note: variableParameters filtering is handled by RefactoringApplier via ApplyConfig.requireVariableParams.
+    // Do NOT filter here to allow patterns without variable params (e.g., exact duplicates) through.
     
     // Sort by score descending, then by name for deterministic ordering
-    val sorted = filtered.sortBy(s => (-s.decision.score, s.suggestedModelName))
+    val sorted = suggestions.sortBy(s => (-s.decision.score, s.suggestedModelName))
     
     // Track covered paths across all files: Set[path]
     // In cross-query analysis, we need to track by (sourceId, path)

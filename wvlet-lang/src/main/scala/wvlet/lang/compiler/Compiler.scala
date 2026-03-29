@@ -30,6 +30,7 @@ import wvlet.lang.compiler.planner.ExecutionPlanRewriter
 import wvlet.lang.compiler.planner.ExecutionPlanner
 import wvlet.lang.compiler.transform.HiveRewriteFunctions
 import wvlet.lang.compiler.transform.HiveRewriteUnnest
+import wvlet.lang.compiler.transform.ImplicitJoinRewriter
 import wvlet.lang.compiler.transform.Incrementalize
 import wvlet.lang.compiler.transform.JoinFlattener
 import wvlet.lang.compiler.transform.PreprocessLocalExpr
@@ -88,6 +89,7 @@ object Compiler extends LogSupport:
   def transformPhases: List[Phase] = List(
     RewriteExpr,          // Rewrite expressions in the logical plan
     JoinFlattener,        // Flatten left-deep join trees from parenthesized SQL
+    ImplicitJoinRewriter, // Convert implicit joins (comma + WHERE) to explicit INNER JOINs
     TrinoRewritePivot,    // Rewrite pivot to group-by for engines not supporting pivot functions
     HiveRewriteFunctions, // Rewrite functions for Hive compatibility
     HiveRewriteUnnest,    // Rewrite UNNEST to LATERAL VIEW for Hive
