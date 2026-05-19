@@ -1,8 +1,10 @@
 import scala.scalanative.build.BuildTarget
 import scala.scalanative.build.GC
 import scala.scalanative.build.Mode
+import scala.scalanative.build.NativeConfig
 
-val AIRFRAME_VERSION       = "2025.1.21"
+val AIRFRAME_VERSION = "2025.1.27"
+
 val AIRSPEC_VERSION        = AIRFRAME_VERSION
 val TRINO_VERSION          = "476"
 val AWS_SDK_VERSION        = "2.20.146"
@@ -103,7 +105,14 @@ def generateWvletLib(path: File, packageName: String, className: String): String
 
   def resourceDefs: String = wvFiles
     .map { f =>
-      val name = f.relativeTo(srcDir).get.getPath.stripSuffix(".wv").replaceAll("/", "__")
+      // Use replace instead of replaceAll to handle both Unix and Windows path separators
+      val name = f
+        .relativeTo(srcDir)
+        .get
+        .getPath
+        .stripSuffix(".wv")
+        .replace("/", "__")
+        .replace("\\", "__")
 
       val methodName = name.replaceAll("-", "_")
       methodNames += methodName
@@ -146,8 +155,7 @@ lazy val lang = crossProject(JVMPlatform, JSPlatform, NativePlatform)
     buildSettings,
     name := "wvlet-lang",
     // Embed the standard library in the jar
-    Compile / unmanagedResourceDirectories +=
-      (ThisBuild / baseDirectory).value / "wvlet-stdlib",
+    Compile / unmanagedResourceDirectories += (ThisBuild / baseDirectory).value / "wvlet-stdlib",
     libraryDependencies ++=
       Seq(
         "org.wvlet.airframe" %% "airframe" % AIRFRAME_VERSION,
@@ -182,8 +190,7 @@ val specRunnerSettings = Seq(
   // Fork JVM to enable JVM options for Trino
   Test / fork := true,
   // When forking, the base directory should be set to the root directory
-  Test / baseDirectory :=
-    (ThisBuild / baseDirectory).value,
+  Test / baseDirectory := (ThisBuild / baseDirectory).value,
   // Watch changes of example .wv files upon testing
   Test / watchSources ++=
     ((ThisBuild / baseDirectory).value / "spec" ** "*.wv").get ++
@@ -203,12 +210,20 @@ lazy val wvcLib = project
     buildSettings,
     name := "wvc-lib",
     nativeConfig ~= { c =>
-      c.withBuildTarget(BuildTarget.libraryDynamic)
+      val baseConfig = c
+        .withBuildTarget(BuildTarget.libraryDynamic)
         // Generates libwvlet.so, libwvlet.dylib, libwvlet.dll
         .withBaseName("wvlet")
         .withSourceLevelDebuggingConfig(_.enableAll) // enable generation of debug information
         // Boehm GC's non-moving behavior helps avoid Segmentation Fault in DLLs
         .withGC(GC.boehm)
+      // Allow overriding target triple via environment variable for cross-compilation
+      sys.env.get("SCALANATIVE_TARGET_TRIPLE") match {
+        case Some(triple) =>
+          baseConfig.withTargetTriple(triple)
+        case None =>
+          baseConfig
+      }
     }
   )
   .dependsOn(wvc)
@@ -264,11 +279,7 @@ lazy val nativeCliMacArm = nativeCrossProject(
   linkerOptions = Seq("-fuse-ld=ld64.lld")
 )
 
-lazy val nativeCliMacIntel = nativeCrossProject(
-  "mac-x64",
-  "x86_64-apple-darwin",
-  linkerOptions = Seq("-fuse-ld=ld64.lld")
-)
+// Note: macOS Intel (x86_64-apple-darwin) target removed - Apple no longer sells Intel Macs
 
 lazy val nativeCliLinuxIntel = nativeCrossProject(
   "linux-x64",
@@ -307,9 +318,8 @@ lazy val cli = project
     name := "wvlet-cli",
     // Need to fork a JVM to avoid DuckDB crash while running runner/cli test simultaneously
     Test / fork          := true,
-    Test / baseDirectory :=
-      (ThisBuild / baseDirectory).value,
-    packQuick :=
+    Test / baseDirectory := (ThisBuild / baseDirectory).value,
+    packQuick            :=
       // Run the default pack task
       (Runtime / pack).value,
     pack :=
@@ -432,8 +442,7 @@ lazy val server = project
         "org.wvlet.airframe" %% "airframe-launcher"   % AIRFRAME_VERSION,
         "org.wvlet.airframe" %% "airframe-http-netty" % AIRFRAME_VERSION
       ),
-    reStart / baseDirectory :=
-      (ThisBuild / baseDirectory).value
+    reStart / baseDirectory := (ThisBuild / baseDirectory).value
   )
   .dependsOn(api.jvm, client.jvm, runner)
 
@@ -511,7 +520,7 @@ def uiSettings: Seq[Setting[?]] = Seq(
 
 def linkerConfig(config: StandardConfig): StandardConfig = {
   config
-    // Check IR works properly since Scala.js 1.20.1 https://github.com/scala-js/scala-js/pull/4867
+    // Check IR works properly since Scala.js 1.20.2 https://github.com/scala-js/scala-js/pull/4867
     .withCheckIR(true)
     .withSourceMap(true)
     .withModuleKind(ModuleKind.ESModule)

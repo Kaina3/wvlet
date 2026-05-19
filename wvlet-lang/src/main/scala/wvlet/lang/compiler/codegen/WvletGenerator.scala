@@ -211,6 +211,20 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
         unary(o, "offset", o.rows)
       case c: Count =>
         unary(c, "count", Nil)
+      case m: ModelScan =>
+        // ModelScan: reference to a defined model with arguments
+        code(m) {
+          val modelName = text(m.name.fullName)
+          val args =
+            if m.modelArgs.isEmpty then
+              empty
+            else
+              paren(cl(m.modelArgs.map(arg => expr(arg))))
+          if sc.inFromClause then
+            modelName + args
+          else
+            group(text("from") + ws + modelName + args)
+        }
       case t: TableInput =>
         code(t) {
           if sc.inFromClause then
@@ -248,35 +262,75 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
               )
         }
       case j: Join =>
-        val left  = relation(j.left)
-        val right = relation(j.right)(using InFromClause)
+        // If this is a left-deep join chain (often produced from parenthesized SQL joins),
+        // render it as a flat sequence of join clauses.
+        case class JoinItem(joinType: JoinType, right: Relation, cond: JoinCriteria, asof: Boolean)
 
-        val asof: Option[Doc] =
-          if j.asof then
-            Some(text("asof") + ws)
+        def stripJoinBraces(r: Relation): Relation =
+          r match
+            case b: BracedRelation if b.child.isInstanceOf[Join] =>
+              stripJoinBraces(b.child)
+            case other =>
+              other
+
+        def collectLeftDeepJoinChain(rel: Relation): Option[(Relation, List[JoinItem])] =
+          val items = scala.collection.mutable.ListBuffer.empty[JoinItem]
+          var cur: Relation = stripJoinBraces(rel)
+
+          var joinType0: Option[JoinType] = None
+          var asof0: Option[Boolean]      = None
+
+          while cur.isInstanceOf[Join] do
+            val j0 = cur.asInstanceOf[Join]
+
+            // Do not try to flatten implicit joins (comma separated), as they are rendered differently.
+            if j0.joinType == JoinType.ImplicitJoin then
+              return None
+
+            joinType0 match
+              case None =>
+                joinType0 = Some(j0.joinType)
+              case Some(t) =>
+                if t != j0.joinType then
+                  return None
+
+            asof0 match
+              case None =>
+                asof0 = Some(j0.asof)
+              case Some(a) =>
+                if a != j0.asof then
+                  return None
+
+            items.prepend(JoinItem(j0.joinType, j0.right, j0.cond, j0.asof))
+            cur = stripJoinBraces(j0.left)
+
+          // Require at least two joins to justify special formatting.
+          if items.size >= 2 then
+            Some((cur, items.toList))
           else
             None
 
-        val joinType =
-          j.joinType match
+        def joinKeyword(joinType: JoinType, asof: Boolean): Doc =
+          val asofDoc: Option[Doc] = if asof then Some(text("asof") + ws) else None
+          joinType match
             case JoinType.InnerJoin =>
-              wsOrNL + asof + text("join")
+              empty + asofDoc + text("join")
             case JoinType.LeftOuterJoin =>
-              wsOrNL + asof + text("left join")
+              empty + asofDoc + text("left join")
             case JoinType.RightOuterJoin =>
-              wsOrNL + asof + text("right join")
+              empty + asofDoc + text("right join")
             case JoinType.FullOuterJoin =>
-              wsOrNL + asof + text("full join")
+              empty + asofDoc + text("full join")
             case JoinType.CrossJoin =>
-              wsOrNL + asof + text("cross join")
+              empty + asofDoc + text("cross join")
             case JoinType.ImplicitJoin =>
               text(",")
 
-        val cond =
-          j.cond match
+        def joinCond(cond: JoinCriteria): Option[Doc] =
+          cond match
             case NoJoinCriteria =>
               None
-            case n: NaturalJoin =>
+            case _: NaturalJoin =>
               None
             case u: JoinOnTheSameColumns =>
               if u.columns.size == 1 then
@@ -288,9 +342,50 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
             case u: JoinOnEq =>
               Some(wl("on", expr(Expression.concatWithEq(u.keys))))
 
-        code(j) {
-          group(left + joinType + ws + right + nest(wsOrNL + cond))
-        }
+        collectLeftDeepJoinChain(j) match
+          case Some((base, joinItems)) =>
+            val baseDoc = relation(base)
+            val joinLines = joinItems.map { it =>
+              val rightDoc = relation(it.right)(using InFromClause)
+              val condDoc  = joinCond(it.cond)
+              group(joinKeyword(it.joinType, it.asof) + ws + rightDoc + nest(wsOrNL + condDoc))
+            }
+
+            code(j) {
+              joinLines.foldLeft(baseDoc) { (acc, ln) =>
+                acc / ln
+              }
+            }
+          case None =>
+            val left  = relation(j.left)
+            val right = relation(j.right)(using InFromClause)
+
+            val asof: Option[Doc] =
+              if j.asof then
+                Some(text("asof") + ws)
+              else
+                None
+
+            val joinType =
+              j.joinType match
+                case JoinType.InnerJoin =>
+                  wsOrNL + asof + text("join")
+                case JoinType.LeftOuterJoin =>
+                  wsOrNL + asof + text("left join")
+                case JoinType.RightOuterJoin =>
+                  wsOrNL + asof + text("right join")
+                case JoinType.FullOuterJoin =>
+                  wsOrNL + asof + text("full join")
+                case JoinType.CrossJoin =>
+                  wsOrNL + asof + text("cross join")
+                case JoinType.ImplicitJoin =>
+                  text(",")
+
+            val cond = joinCond(j.cond)
+
+            code(j) {
+              group(left + joinType + ws + right + nest(wsOrNL + cond))
+            }
       case u: Union if u.isDistinct =>
         // union is not supported in Wvlet, so rewrite it to dedup(concat)
         code(u) {
@@ -303,7 +398,14 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
               Nil
             case head :: tail =>
               val hd = relation(head)
-              val tl = tail.map(x => indentedBrace(relation(x)))
+              val tl = tail.map { x =>
+                x match
+                  case _: BracedRelation =>
+                    // Already has braces, don't add another
+                    relation(x)
+                  case _ =>
+                    indentedBrace(relation(x))
+              }
               hd :: tl
 
         // TODO union is not supported in Wvlet. Replace tree to dedup(concat)
@@ -353,9 +455,15 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
       case v: Values =>
         values(v)
       case b: BracedRelation =>
-        code(b) {
-          codeBlock(relation(b.child)(using InSubQuery))
-        }
+        // Parenthesized SQL joins may appear as BracedRelation(Join(...)) in parse-only mode.
+        // Prefer rendering the join itself (without introducing extra `{}` nesting).
+        b.child match
+          case _: Join =>
+            relation(b.child)
+          case _ =>
+            code(b) {
+              codeBlock(relation(b.child)(using InSubQuery))
+            }
       case p: Pivot =>
         val prev      = relation(p.child)
         val pivotKeys = p.pivotKeys.map(expr)
@@ -616,7 +724,8 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
         case l: Literal =>
           text(l.stringValue)
         case bq: BackquoteInterpolatedIdentifier =>
-          val p    = expr(bq.prefix)
+          // Only output prefix if it's not empty
+          val prefixDoc = if bq.prefix.isEmpty then text("") else expr(bq.prefix)
           val body = bq
             .parts
             .map {
@@ -625,7 +734,7 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
               case e =>
                 text("${") + expr(e) + text("}")
             }
-          p + text("`") + concat(body) + text("`")
+          prefixDoc + text("`") + concat(body) + text("`")
         case bq: BackQuotedIdentifier =>
           text(s"`${bq.unquotedValue}`")
         case w: Wildcard =>
@@ -797,6 +906,9 @@ class WvletGenerator(config: CodeFormatterConfig = CodeFormatterConfig())(using
         case e: Extract =>
           // Convert EXTRACT(field FROM expr) to expr.extract(field)
           expr(e.expr) + text(".extract") + paren(text(s"'${e.interval.toString.toLowerCase}'"))
+        case n: NamedParameter =>
+          // Output named parameter as $name (e.g., $P3)
+          text(s"$$${n.name}")
         case other =>
           unsupportedNode(s"expression ${other}", other.span)
     }
