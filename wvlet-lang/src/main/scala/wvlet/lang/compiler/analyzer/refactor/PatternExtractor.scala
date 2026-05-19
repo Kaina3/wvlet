@@ -34,6 +34,8 @@ import wvlet.log.LogSupport
   *   Maximum number of suggestions to generate
   * @param crossQueryAnalysis
   *   Whether to analyze patterns across multiple queries
+  * @param selectionMode
+  *   Strategy for selecting non-overlapping suggestions
   */
 case class PatternExtractorConfig(
     enabled: Boolean = true,
@@ -41,7 +43,8 @@ case class PatternExtractorConfig(
     collectorConfig: CollectorConfig = CollectorConfig.default,
     detectorConfig: DetectorConfig = DetectorConfig.default,
     maxSuggestions: Int = 10,
-    crossQueryAnalysis: Boolean = false
+    crossQueryAnalysis: Boolean = false,
+    selectionMode: RefactoringSelectionMode = RefactoringSelectionMode.Greedy
 )
 
 object PatternExtractorConfig:
@@ -203,14 +206,15 @@ object PatternExtractor extends Phase("pattern-extractor") with LogSupport:
     // Run hierarchical analysis to find optimal suggestions
     val hierarchyResult = RefactoringDecider.evaluateHierarchically(
       detectionResult,
-      config.refactorConfig
+      config.refactorConfig,
+      config.selectionMode
     )
 
     // Use optimal suggestions (filtered for nested patterns)
     val suggestions = hierarchyResult.optimalSuggestions.take(config.maxSuggestions)
 
     // Generate report
-    val report = RefactoringDecider.generateHierarchicalReport(detectionResult, config.refactorConfig)
+    val report = RefactoringDecider.formatHierarchicalReport(hierarchyResult, config.selectionMode)
 
     PatternExtractionResult(suggestions, detectionResult, report, Some(hierarchyResult))
 
@@ -246,7 +250,8 @@ object PatternExtractor extends Phase("pattern-extractor") with LogSupport:
     val t2 = System.currentTimeMillis()
     val hierarchyResult = RefactoringDecider.evaluateHierarchically(
       detectionResult,
-      config.refactorConfig
+      config.refactorConfig,
+      config.selectionMode
     )
     val t3 = System.currentTimeMillis()
     println(s"  [PatternExtractor] Hierarchical evaluation: ${t3 - t2}ms")
@@ -255,7 +260,7 @@ object PatternExtractor extends Phase("pattern-extractor") with LogSupport:
     val suggestions = hierarchyResult.optimalSuggestions.take(config.maxSuggestions)
 
     // Generate report
-    val report = RefactoringDecider.generateHierarchicalReport(detectionResult, config.refactorConfig)
+    val report = RefactoringDecider.formatHierarchicalReport(hierarchyResult, config.selectionMode)
 
     PatternExtractionResult(suggestions, detectionResult, report, Some(hierarchyResult))
 

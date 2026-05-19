@@ -30,7 +30,8 @@ import wvlet.log.LogSupport
   * @param skipIfOverlaps Whether to skip suggestions that would conflict with already-applied ones
   * @param requireVariableParams Only apply suggestions that have variable parameters
   * @param perFileMinOccurrences For multi-file apply: minimum occurrences per file to apply a pattern there
-  * @param usePerFileSelection For multi-file apply: use per-file greedy selection instead of global optimal
+   * @param usePerFileSelection For multi-file apply: use per-file greedy selection instead of global optimal
+   * @param selectionMode Selection strategy produced by pattern extraction
   */
 case class ApplyConfig(
     topK: Int = 0,
@@ -39,7 +40,8 @@ case class ApplyConfig(
     skipIfOverlaps: Boolean = true,
     requireVariableParams: Boolean = true,
     perFileMinOccurrences: Int = 2,
-    usePerFileSelection: Boolean = true
+    usePerFileSelection: Boolean = true,
+    selectionMode: RefactoringSelectionMode = RefactoringSelectionMode.Greedy
 )
 
 object ApplyConfig:
@@ -409,7 +411,9 @@ object RefactoringApplier extends LogSupport:
 
     // Use all suggestions (including subsumed) for per-file selection mode
     // Otherwise fall back to optimal-only for backward compatibility
-    val baseSuggestions = if config.usePerFileSelection then
+    val baseSuggestions = if config.selectionMode == RefactoringSelectionMode.OptimizeScore then
+      extraction.optimalSuggestions
+    else if config.usePerFileSelection then
       extraction.allSuggestions
     else if config.useOptimalSuggestions then
       extraction.optimalSuggestions

@@ -58,6 +58,23 @@ case class CollectedSubtree(
 end CollectedSubtree
 
 /**
+  * Lightweight metadata for a subtree occurrence.
+  * Unlike CollectedSubtree, this does NOT hold a reference to the LogicalPlan root,
+  * allowing the original AST to be garbage-collected immediately after traversal.
+  * Used for memory-efficient global pattern extraction (streaming mode).
+  */
+case class SubtreeMetadata(
+    structuralHash: Int,
+    nodeType:       String,
+    nodeCount:      Int,
+    path:           List[Int],
+    sourceId:       Option[String] = None
+):
+  def isDescendantOf(other: SubtreeMetadata): Boolean =
+    path.length > other.path.length && path.startsWith(other.path)
+end SubtreeMetadata
+
+/**
   * Configuration for subtree collection
   *
   * @param minDepth
@@ -326,5 +343,130 @@ object SubtreeCollector extends LogSupport:
         case sq: SubQueryExpression => sq :: Nil
         case _ => expr.children.flatMap(findInExpr).toList
     node.childExpressions.flatMap(findInExpr).toList
+
+  // ---------------------------------------------------------------------------
+  // Streaming (memory-efficient) metadata-only collection
+  // ---------------------------------------------------------------------------
+
+  /**
+    * Stream-friendly metadata collection. Traverses `plan` once, emitting SubtreeMetadata
+    * entries into `acc`. The LogicalPlan is NOT retained anywhere in `acc` — drop your
+    * reference to `plan` after calling this method and the AST is eligible for GC.
+    *
+    * @param plan     The root plan to traverse
+    * @param config   Collection configuration
+    * @param sourceId Optional source identifier (e.g. filename)
+    * @param acc      Global accumulator: structuralHash → occurrences
+    */
+  def collectMetadataInto(
+      plan:     LogicalPlan,
+      config:   CollectorConfig = CollectorConfig.default,
+      sourceId: Option[String]  = None,
+      acc:      scala.collection.mutable.HashMap[Int, scala.collection.mutable.ListBuffer[SubtreeMetadata]]
+  ): Unit =
+    traverseMetadata(plan, 0, Nil, config, sourceId, acc)
+    // `plan` reference is not captured anywhere in `acc` — eligible for GC
+
+  private def traverseMetadata(
+      node:         LogicalPlan,
+      currentDepth: Int,
+      path:         List[Int],
+      config:       CollectorConfig,
+      sourceId:     Option[String],
+      acc:          scala.collection.mutable.HashMap[Int, scala.collection.mutable.ListBuffer[SubtreeMetadata]]
+  ): (Int, Int) = // Returns (depth, nodeCount)
+    if config.maxDepth > 0 && currentDepth > config.maxDepth then
+      return (0, 0)
+
+    val childResults = node.children.zipWithIndex.map { case (child, idx) =>
+      traverseMetadata(child, currentDepth + 1, path :+ idx, config, sourceId, acc)
+    }
+
+    // Also traverse SubQueryExpression's inner queries (same logic as traverse)
+    val subQueryExprs = collectSubQueryExpressions(node)
+    subQueryExprs.zipWithIndex.foreach { case (sq, sqIdx) =>
+      traverseMetadata(sq.query, currentDepth + 1, path :+ (1000 + sqIdx), config, sourceId, acc)
+    }
+
+    val depth =
+      if childResults.isEmpty then 1
+      else childResults.map(_._1).max + 1
+
+    val nodeCount =
+      if childResults.isEmpty then 1
+      else childResults.map(_._2).sum + 1
+
+    val shouldCollect =
+      isRefactorableNode(node, config) &&
+        depth >= config.minDepth &&
+        nodeCount >= config.minNodeCount
+
+    if shouldCollect then
+      val hash = StructuralHasher.hash(node, config.hashConfig)
+      val meta = SubtreeMetadata(
+        structuralHash = hash,
+        nodeType       = node.getClass.getSimpleName.toLowerCase,
+        nodeCount      = nodeCount,
+        path           = path,
+        sourceId       = sourceId
+      )
+      acc.getOrElseUpdate(hash, scala.collection.mutable.ListBuffer.empty) += meta
+      // `node` is NOT captured anywhere in `meta` — eligible for GC after this point
+
+    (depth, nodeCount)
+
+  /**
+    * Remove SubtreeMetadata entries that are descendants of another entry from the same source.
+    * Mirrors removeOverlapping for CollectedSubtree.
+    */
+  def removeMetadataOverlapping(metas: List[SubtreeMetadata]): List[SubtreeMetadata] =
+    val bySource = metas.groupBy(_.sourceId)
+    bySource.valuesIterator.flatMap(removeMetadataOverlappingMetaWithinSource).toList
+
+  private def removeMetadataOverlappingMetaWithinSource(metas: List[SubtreeMetadata]): List[SubtreeMetadata] =
+    if metas.size <= 1 then
+      metas
+    else
+      val sorted = metas.sortBy(_.path.length)
+      val trie   = new PathTrie
+      val out    = ListBuffer.empty[SubtreeMetadata]
+      sorted.foreach { s =>
+        if trie.hasAncestor(s.path) then
+          ()
+        else
+          out += s
+          trie.add(s.path)
+      }
+      out.toList
+
+  /**
+    * Navigate to the subtree at the given path in a LogicalPlan tree.
+    *
+    * Returns None if the path is invalid (out-of-bounds index or missing subquery expression).
+    * Mirrors the path encoding used by [[traverse]] and [[traverseMetadata]]:
+    *   - Indices 0..N-1 address the N children of the node.
+    *   - Indices >= 1000 address SubQueryExpression inner queries (1000+sqIdx).
+    *
+    * @param plan The root plan to navigate from.
+    * @param path The path to follow (empty = return root).
+    * @return The subtree at the path, or None if the path is invalid.
+    */
+  def navigatePath(plan: LogicalPlan, path: List[Int]): Option[LogicalPlan] =
+    path match
+      case Nil => Some(plan)
+      case head :: tail =>
+        if head >= 1000 then
+          val sqIdx        = head - 1000
+          val subQueryExprs = collectSubQueryExpressions(plan)
+          if sqIdx >= 0 && sqIdx < subQueryExprs.size then
+            navigatePath(subQueryExprs(sqIdx).query, tail)
+          else
+            None
+        else
+          val children = plan.children
+          if head >= 0 && head < children.size then
+            navigatePath(children(head), tail)
+          else
+            None
 
 end SubtreeCollector
